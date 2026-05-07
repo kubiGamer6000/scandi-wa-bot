@@ -1,0 +1,26 @@
+node_modules
+dist
+
+.env
+.env.*
+!.env.example
+
+# WhatsApp auth state — DO NOT COMMIT (contains session credentials)
+data/
+
+# Drizzle generated artifacts
+drizzle/
+
+# Conversation exports
+out/
+
+# Logs
+*.log
+logs/
+
+# OS / editor
+.DS_Store
+.idea
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json.example
