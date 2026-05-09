@@ -11,6 +11,10 @@ A single Node.js process owns:
   event and writes through to the DB.
 - One **in-memory LRU `MessageCache`** (`src/store/cache.ts`) to satisfy
   Baileys' `getMessage` config without hitting the DB on every retry/poll.
+- One **`MediaWorker`** (`src/store/media/worker.ts`) that drains the
+  `wa.media` queue (Postgres `FOR UPDATE SKIP LOCKED`) → `downloadMediaMessage`
+  → Firebase Storage. Independent of the socket lifecycle; reconnects
+  do not interrupt in-flight uploads.
 
 ```
                                    ┌───────────────────────────────┐
@@ -73,6 +77,12 @@ A single Node.js process owns:
 | **Extraction helpers** | `src/store/extract.ts`             | Pure functions that project Baileys protos into flat DB rows.                                        |
 | **JID utilities**      | `src/store/jids.ts`                | `classifyJid` (DM / group / lid / etc.) and ingest filters.                                          |
 | **Serialization**      | `src/store/serialize.ts`           | Buffer → base64 round-trip for `JSONB` columns.                                                      |
+| **Media storage**      | `src/store/media/storage.ts`       | `MediaStorage` interface + `FirebaseStorage` (uses `firebase-admin/storage` `bucket.file().save()`) + `NoopStorage`. |
+| **Media downloader**   | `src/store/media/downloader.ts`    | One-shot per-row pipeline: rebuild `WAMessage` from DB → `downloadMediaMessage` → `storage.put` → mark `done`. |
+| **Media worker**       | `src/store/media/worker.ts`        | Long-running poll loop. Atomic `FOR UPDATE SKIP LOCKED` claim, lease reaper, exponential backoff, configurable concurrency. |
+| **Processing worker**  | `src/store/processing/worker.ts`   | Second queue worker: claims from `wa.media_processing`, routes to AI processors, stores result text. |
+| **AI processors**      | `src/store/processing/processors/` | `gemini.ts` (video+image via GCS URI), `elevenlabs.ts` (audio transcription), `llamaparse.ts` (document→markdown). |
+| **Prompts**            | `src/store/processing/prompts.ts`  | Default video/image prompts with env-var override support.                                           |
 | **Renderer**           | `src/render/*.ts`                  | Phone/JID → fully merged Markdown timeline.                                                          |
 | **Recon tool**         | `src/recon/*.ts`                   | One-shot Baileys event dumper used during initial design.                                            |
 
@@ -90,14 +100,26 @@ A single Node.js process owns:
    - Otherwise, reads existing creds + signal keys from Postgres.
    - Falls back to fresh `initAuthCreds()` when no row exists, which
      triggers a QR-pair flow on the next connect.
-4. `Bot.connect()` creates the Baileys socket with the loaded auth state
+4. `Bot.start()` builds the **`MediaStorage`** (Firebase if
+   `FIREBASE_STORAGE_BUCKET` is set, otherwise a `NoopStorage`) and starts
+   the **`MediaWorker`**. The store registers the worker as a queue
+   listener so every `messages.upsert` and `messaging-history.set` chunk
+   triggers `worker.notify()`, skipping the next idle poll.
+5. `Bot.connect()` creates the Baileys socket with the loaded auth state
    and calls `store.bind(sock)`. From this point on, every event Baileys
    emits produces a row (or many) in Postgres.
-5. The socket either loads existing creds (silent connect) or prints a QR
+6. The socket either loads existing creds (silent connect) or prints a QR
    to stdout. After pair, WhatsApp triggers a *messaging-history.set*
-   storm; `handleHistorySet` ingests each chunk idempotently.
-6. Real-time events take over. The bot's hello-world handler runs in
-   parallel with the store's persistence handlers.
+   storm; `handleHistorySet` ingests each chunk idempotently. Inserted
+   `wa.media` rows wake the worker which begins draining the queue in
+   parallel with ongoing message ingestion.
+7. `Bot.start()` also starts the **`ProcessingWorker`** which drains
+   `wa.media_processing`. When the media worker finishes uploading a file,
+   `enqueueProcessing()` inserts a processing job; the processing worker
+   picks it up and routes to the appropriate AI service.
+8. Real-time events take over. The bot's hello-world handler runs in
+   parallel with the store's persistence handlers, media worker, and
+   processing worker.
 
 ## Data flow at a glance
 
@@ -189,6 +211,55 @@ parity, so:
 `auth.clear()` deletes every `auth_keys` and `auth_creds` row for the
 account; called on permanent `loggedOut` so the next start triggers a
 fresh QR pair.
+
+## Media pipeline (Postgres queue → Firebase Storage)
+
+The `wa.media` table doubles as a metadata store **and** a durable work
+queue. Every media-bearing message ingested by `messages.upsertMessages`
+inserts a row with `download_status='pending'`; the bytes are not touched
+yet. A long-running [`MediaWorker`](../src/store/media/worker.ts) drains
+that queue:
+
+```
+                         atomic claim
+                         (FOR UPDATE SKIP LOCKED)
+       ┌──────┐         ┌──────────────┐         ┌──────────┐
+       │ wa.  │ ◄───────│ MediaWorker   │────────►│ Baileys  │
+       │ media│         │ pollLoop()    │ get raw │ download │
+       │      │         │ + lease reaper│ message │MediaMsg()│
+       └──────┘         └───────┬──────┘         └────┬─────┘
+                                │                     │ buffer
+                                │ on done             ▼
+                                │              ┌──────────────┐
+                                ▼              │  Firebase    │
+                         ┌──────────────┐      │  Storage     │
+                         │ UPDATE       │ ◄────│  bucket.file │
+                         │ wa.media     │      │  .save()     │
+                         │ SET status…  │      └──────────────┘
+                         └──────────────┘
+```
+
+Why a Postgres queue instead of Cloud Tasks / Sidekiq / a separate
+broker:
+
+- **Durable** — the queue lives in the same DB as the message it
+  references; no broker can drift.
+- **Atomic claim** — `FOR UPDATE SKIP LOCKED` is deadlock-free and
+  handles thousands of jobs/sec, far above what a WA bot needs.
+- **Free retries / backoff** — the next-attempt timestamp is just a
+  column. No DLQs, no extra infra.
+- **Crash recovery** — leases (`lease_until`) let a reaper sweep
+  abandoned in-progress rows on every poll cycle.
+
+The storage backend is abstracted behind the
+[`MediaStorage`](../src/store/media/storage.ts) interface. The default
+`FirebaseStorage` uses the `firebase-admin/storage` SDK (`bucket.file().save(buffer)`)
+and produces a token-bearing public URL via `getDownloadURL()`. Adding
+S3/R2 later is one new class.
+
+See [`INGESTION.md`](INGESTION.md#media-pipeline-download--upload--persist)
+for the full state machine, tuning knobs, failure modes, and
+operational queries.
 
 ## Why an LRU + the DB for `getMessage`
 

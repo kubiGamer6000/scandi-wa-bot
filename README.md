@@ -96,16 +96,26 @@ npm run render -- +359884430293
   real-time updates.
 - Edit history (`wa.message_edits`) and deletion tombstones with reason
   attribution.
+- **Media pipeline:** every image / video / audio / document / sticker
+  / PTV / GIF gets decrypted via Baileys' `downloadMediaMessage` and
+  uploaded to a Firebase Storage bucket. The `wa.media` table doubles
+  as a Postgres-backed work queue with `FOR UPDATE SKIP LOCKED` claim,
+  exponential backoff, and lease-based crash recovery — no Redis or
+  Cloud Tasks required. Pluggable storage backend (Firebase today,
+  trivially swappable for S3/R2 later).
 - Conversation renderer that merges PN-form and LID-form chats and exports
   a Markdown timeline including reactions, edits, deletions, system events.
 
+- **AI processing pipeline:** after media upload, a second Postgres-backed
+  queue (`wa.media_processing`) routes files to AI services for analysis:
+  - **Video/Image** → Gemini (via `gs://` URI, zero re-download)
+  - **Audio** → ElevenLabs Scribe v2 (full transcript)
+  - **Documents** → LlamaParse (PDF/DOCX/XLSX → clean Markdown)
+  - Customizable prompts, exponential backoff, crash recovery.
+  - Results stored as text in `wa.media_processing.result_text`.
+
 **Not yet built (deliberately):**
 
-- Media downloader + GCS upload pipeline. The `wa.media` rows already carry
-  every field the downloader will need; `download_status` is `pending` until
-  a worker fills `gcs_bucket` / `gcs_object`.
-- Audio transcription, image description, video summarisation. These will
-  hang off the same `wa.media` table.
 - Scheduled report delivery (cron jobs that pull from internal API and
   message a chat at a fixed time).
 - Telegram bridge for re-auth notifications when the WA session drops.

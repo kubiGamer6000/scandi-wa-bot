@@ -10,9 +10,11 @@ import qrcode from 'qrcode-terminal'
 
 import { loadAuthState, type AuthHandle } from './auth.js'
 import { config } from './config.js'
-import { handleIncomingMessages } from './handlers/messages.js'
 import { childLogger, logger } from './logger.js'
 import { ChatStore } from './store/index.js'
+import { buildMediaStorage, MediaWorker } from './store/media/index.js'
+import { ProcessingWorker } from './store/processing/index.js'
+import { db } from './db/index.js'
 
 const log = childLogger('bot')
 
@@ -44,6 +46,8 @@ export class Bot {
 	private reconnectAttempt = 0
 	private store: ChatStore | undefined
 	private auth: AuthHandle | undefined
+	private mediaWorker: MediaWorker | undefined
+	private processingWorker: ProcessingWorker | undefined
 
 	/** Cached group metadata to avoid a USync request on every group send. */
 	private readonly groupCache = new Map<string, GroupMetadata>()
@@ -54,6 +58,28 @@ export class Bot {
 		// `creds` reference (Baileys mutates it in place); signal keys go
 		// through the cached store, which is itself stable.
 		this.auth = await loadAuthState(this.store.accountId)
+
+		// Media downloader runs as an independent worker, polling wa.media for
+		// rows in 'pending' status. The store wakes it up after every upsert.
+		const storage = buildMediaStorage(config.media.firebase)
+		this.mediaWorker = new MediaWorker(
+			{ accountId: this.store.accountId, db, log: childLogger('store:media') },
+			storage,
+			config.media
+		)
+		this.mediaWorker.bindSocket(() => this.sock ?? null)
+		this.store.bindMediaQueue(this.mediaWorker)
+		this.mediaWorker.start()
+
+		// AI processing worker: drains wa.media_processing after media
+		// download completes. Routes to Gemini / ElevenLabs / LlamaParse.
+		this.processingWorker = new ProcessingWorker(
+			{ accountId: this.store.accountId, db, log: childLogger('store:processing') },
+			storage,
+			config.processing
+		)
+		this.processingWorker.start()
+
 		await this.connect()
 	}
 
@@ -66,6 +92,16 @@ export class Bot {
 			await this.sock?.end(undefined)
 		} catch (err) {
 			log.warn({ err }, 'error during socket shutdown (ignored)')
+		}
+		try {
+			await this.mediaWorker?.stop()
+		} catch (err) {
+			log.warn({ err }, 'error stopping media worker (ignored)')
+		}
+		try {
+			await this.processingWorker?.stop()
+		} catch (err) {
+			log.warn({ err }, 'error stopping processing worker (ignored)')
 		}
 	}
 
@@ -121,11 +157,6 @@ export class Bot {
 			} catch (err) {
 				log.warn({ err, id }, 'failed to refresh group metadata')
 			}
-		})
-
-		// Hello-world responder. The store handles persistence in parallel.
-		sock.ev.on('messages.upsert', upsert => {
-			void handleIncomingMessages(sock, upsert)
 		})
 	}
 

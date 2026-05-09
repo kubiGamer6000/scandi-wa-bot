@@ -47,6 +47,26 @@ watch `wa.sync_state.history_progress_pct` climb to 100 and then
 | `SYNC_FULL_HISTORY`       | `true`             | Ask WhatsApp for the full history after pair.                                      |
 | `MARK_ONLINE_ON_CONNECT`  | `false`            | When `false`, your phone keeps getting WA push notifications.                      |
 | `ALLOWED_JIDS`            | _(empty)_          | Comma-separated allow-list for outbound messages (handy while testing).            |
+| `FIREBASE_STORAGE_BUCKET` | _(empty)_          | When set, the media downloader is enabled. See "Media storage setup" below.        |
+| `FIREBASE_SERVICE_ACCOUNT_PATH` | _(empty)_    | Path to a service-account JSON. Alternative: `FIREBASE_SERVICE_ACCOUNT_JSON` (inline) or `GOOGLE_APPLICATION_CREDENTIALS` (ADC). |
+| `MEDIA_DOWNLOAD_ENABLED`  | auto               | Master switch. Defaults to ON when `FIREBASE_STORAGE_BUCKET` is set.               |
+| `MEDIA_TYPES`             | all 7              | Allow-list of media types to upload (`image,video,audio,document,sticker,ptv,gif`). |
+| `MEDIA_MAX_BYTES`         | `104857600` (100 MiB) | Per-file size cap. Larger files are marked `skipped`.                           |
+| `MEDIA_DOWNLOAD_CONCURRENCY` | `3`             | Parallel downloads.                                                                |
+| `MEDIA_DOWNLOAD_BATCH_SIZE` | `10`             | Rows claimed per poll cycle.                                                       |
+| `MEDIA_DOWNLOAD_POLL_MS`  | `5000`             | Idle poll interval (worker also wakes on every new media row).                     |
+| `MEDIA_LEASE_SECONDS`     | `120`              | How long a row stays `in_progress` before the reaper takes it back.                |
+| `MEDIA_MAX_ATTEMPTS`      | `6`                | Hard cap on transient retries before a row is marked `failed`.                     |
+| `GEMINI_API_KEY`          | _(empty)_          | Enables video + image processing via Gemini. Get from AI Studio.                   |
+| `ELEVENLABS_API_KEY`      | _(empty)_          | Enables audio transcription via ElevenLabs Scribe.                                 |
+| `LLAMA_CLOUD_API_KEY`     | _(empty)_          | Enables document-to-markdown via LlamaParse.                                       |
+| `PROCESSING_ENABLED`      | auto               | Master switch. Defaults to ON when any AI key is set.                              |
+| `PROCESSING_MODEL_VIDEO`  | `gemini-2.5-flash` | Gemini model for video + image analysis.                                           |
+| `PROCESSING_MODEL_AUDIO`  | `scribe_v2`        | ElevenLabs model for transcription.                                                |
+| `PROCESSING_LLAMAPARSE_TIER` | `agentic`       | LlamaParse tier (`fast`/`cost_effective`/`agentic`/`agentic_plus`).                 |
+| `PROCESSING_CONCURRENCY`  | `2`                | Parallel AI calls.                                                                 |
+| `PROCESSING_LEASE_SECONDS`| `600`              | 10-minute lease (AI calls are slow).                                               |
+| `PROCESSING_MAX_ATTEMPTS` | `4`                | Backoff: 1m → 5m → 30m → 2h, then `failed`.                                       |
 
 ### `DATABASE_URL` shape (Supabase)
 
@@ -66,6 +86,49 @@ Notes:
   transaction mode doesn't support PREPARE).
 - Port **5432** (session pooler / direct) supports PREPARE; the client
   enables it automatically.
+
+### Media storage setup (Firebase Storage)
+
+The bot writes original media bytes to a Firebase Storage bucket (which
+is just a Google Cloud Storage bucket with a Firebase-friendly URL
+scheme). Setup once per project:
+
+1. **Enable Storage** in the Firebase Console for your project.
+   Storage requires the **Blaze (pay-as-you-go) plan** even though the
+   free tier is plenty for normal bot traffic.
+2. **Find the bucket name.** Console → Storage → header shows
+   `gs://<bucket>`. Copy `<bucket>` (no `gs://` prefix). Modern projects
+   are `<project-id>.firebasestorage.app`; older ones are
+   `<project-id>.appspot.com`.
+3. **Create a service account.** Console → Project Settings → Service
+   accounts → "Generate new private key". Save the JSON somewhere safe
+   (we suggest `secrets/firebase-service-account.json`, which is
+   gitignored). Make sure the service account has the **Storage Admin**
+   IAM role (the auto-generated "Firebase Admin SDK" account already
+   does).
+4. **Wire it into `.env`.**
+
+   ```dotenv
+   FIREBASE_STORAGE_BUCKET=my-project.firebasestorage.app
+   FIREBASE_SERVICE_ACCOUNT_PATH=secrets/firebase-service-account.json
+   ```
+
+   Alternatives if you'd rather not have a JSON file on disk:
+
+   - `FIREBASE_SERVICE_ACCOUNT_JSON='{"type":"service_account",...}'` —
+     paste the same JSON inline (e.g. for Docker secrets / Heroku env).
+   - Set `GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json` — Firebase
+     Admin will pick this up via Application Default Credentials with
+     no other config needed.
+
+5. **Restart the bot.** On boot you'll see
+   `media storage: firebase ready`, and the worker will start draining
+   any `pending` rows already in `wa.media`.
+
+If `FIREBASE_STORAGE_BUCKET` is unset the bot still runs end-to-end:
+metadata is captured into `wa.media` as usual, the worker idles, and
+no upload attempts are made. Adding credentials later and restarting
+backfills the queue automatically.
 
 ### IPv6 / `ENETUNREACH` workaround
 
@@ -191,15 +254,56 @@ FROM wa.contacts
 WHERE pn ILIKE '%359884430293%' OR jid ILIKE '%359884430293%';
 ```
 
-### Pending media (for the future downloader)
+### Media queue health
 
 ```sql
-SELECT m.media_type, m.mime_type, m.file_length, m.download_status, m.inserted_at
-FROM wa.media m
-WHERE m.download_status IN ('pending','failed')
-ORDER BY m.inserted_at DESC
-LIMIT 50;
+-- queue depth at a glance
+SELECT download_status, count(*), min(inserted_at) AS oldest
+FROM wa.media GROUP BY 1 ORDER BY 1;
+
+-- what's about to be tried, and what's deferred for backoff
+SELECT id, chat_jid, message_id, media_type, download_attempts,
+       download_error, next_attempt_at
+FROM wa.media
+WHERE download_status = 'pending'
+ORDER BY next_attempt_at LIMIT 20;
+
+-- in-flight rows (the worker is processing these now)
+SELECT id, worker_id, lease_until, download_attempts
+FROM wa.media WHERE download_status = 'in_progress';
+
+-- biggest uploads in the last day
+SELECT media_type, mime_type, size_bytes, gcs_object, completed_at
+FROM wa.media
+WHERE download_status='done' AND completed_at > NOW() - interval '1 day'
+ORDER BY size_bytes DESC LIMIT 20;
 ```
+
+### Force-retry stuck or failed media
+
+```sql
+-- retry every row that gave up (clears the attempt counter so backoff
+-- starts fresh)
+UPDATE wa.media
+SET download_status = 'pending',
+    download_attempts = 0,
+    next_attempt_at = NOW(),
+    download_error = NULL,
+    lease_until = NULL,
+    worker_id = NULL
+WHERE download_status = 'failed';
+
+-- retry a single row
+UPDATE wa.media
+SET download_status = 'pending', next_attempt_at = NOW(),
+    download_error = NULL, lease_until = NULL, worker_id = NULL
+WHERE id = 12345;
+```
+
+The worker wakes up every `MEDIA_DOWNLOAD_POLL_MS` (default 5s) and will
+pick the rows up on its next poll. Setting up `LISTEN media_pending`
+notifications instead is a future optimization but not necessary at our
+scale.
 
 ### Trigram fuzzy text search
 

@@ -6,11 +6,18 @@ import type { StoreContext } from '../types.js'
 
 const { reactions, accounts } = schema
 
-const toDate = (v: number | Long | null | undefined): Date => {
+// Postgres `timestamptz` accepts a wide range, but values produced by
+// misinterpreting microseconds as milliseconds (e.g. ~ year 58000) trigger
+// "time zone displacement out of range" errors. Clamp to a sane WhatsApp era.
+const MIN_MS = Date.UTC(2010, 0, 1)
+const MAX_MS = Date.UTC(9999, 11, 31)
+
+/** Convert a millisecond timestamp (from `senderTimestampMs` etc.) to a Date. */
+const toDateFromMs = (v: number | Long | null | undefined): Date => {
 	if (v == null) return new Date()
 	const n = typeof v === 'number' ? v : Number(v)
-	if (!Number.isFinite(n) || n <= 0) return new Date()
-	return new Date(n * 1000)
+	if (!Number.isFinite(n) || n < MIN_MS || n > MAX_MS) return new Date()
+	return new Date(n)
 }
 
 /**
@@ -31,7 +38,7 @@ export const handleReactions = async (
 		const actorJid = ev.reaction.key?.participant ?? ev.reaction.key?.remoteJid
 		if (!chatJid || !messageId || !actorJid) continue
 
-		const ts = toDate(ev.reaction.senderTimestampMs as number | null | undefined)
+		const ts = toDateFromMs(ev.reaction.senderTimestampMs as number | null | undefined)
 		const emoji = ev.reaction.text?.trim() || null
 
 		await db

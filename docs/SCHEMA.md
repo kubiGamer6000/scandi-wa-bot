@@ -9,6 +9,8 @@ them.
 | --------------------------------- | -------------------------------------------- |
 | `0001_init_wa_schema.sql`         | Core message store: 15 tables + indexes.     |
 | `0002_auth_state.sql`             | Postgres-backed Baileys auth: `auth_creds`, `auth_keys`. |
+| `0003_media_queue.sql`            | Queue columns on `wa.media` (`next_attempt_at`, `lease_until`, `completed_at`, `size_bytes`, `content_type`, `gcs_url`, claim/lease indexes). |
+| `0004_media_processing.sql`      | AI processing queue: `wa.media_processing` with claim/lease indexes, unique constraint on `(media_id, processor)`. |
 
 Apply with:
 
@@ -259,38 +261,98 @@ was removed; we never delete the row so we keep the history of "they
 
 ### `wa.media`
 
-Per-message media metadata. The downloader (not yet built) will fill
-`gcs_*` once the file is uploaded; until then `download_status` is
-`pending`. The full original raw payload is preserved in `raw` JSONB so we
-can re-derive any field we missed.
+Per-message media metadata **and a Postgres-backed work queue for the
+downloader**. Every row is created with `download_status='pending'` by
+the message ingester and then walked through the state machine below by
+[`MediaWorker`](../src/store/media/worker.ts). The full original raw
+payload is preserved in `raw` JSONB so we can re-derive any field we
+missed (or re-decrypt if WA refreshes the URL).
 
-| Column              | Type        | Notes                                                                 |
-| ------------------- | ----------- | --------------------------------------------------------------------- |
-| `media_type`        | `TEXT`      | `image` / `video` / `audio` / `document` / `sticker` / `ptv` / `gif`. |
-| `mime_type`         | `TEXT`      |                                                                       |
-| `file_name`         | `TEXT`      | For documents.                                                        |
-| `file_length`       | `BIGINT`    | Bytes (the encrypted blob length).                                    |
-| `width`/`height`    | `INT`       | Images, videos, stickers.                                             |
-| `duration_seconds`  | `INT`       | Audio, video.                                                         |
-| `page_count`        | `INT`       | Documents.                                                            |
-| `media_key`         | `BYTEA`     | AES key needed to decrypt the blob. Treat as secret.                  |
-| `file_sha256`       | `BYTEA`     |                                                                       |
-| `file_enc_sha256`   | `BYTEA`     |                                                                       |
-| `direct_path`/`url` | `TEXT`      | What you'd hand to `downloadMediaMessage`.                            |
-| `thumbnail`         | `BYTEA`     | Inline preview blob.                                                  |
-| `jpeg_thumbnail`    | `BYTEA`     | Smaller JPEG preview, when available.                                 |
-| `caption`           | `TEXT`      |                                                                       |
-| `download_status`   | `TEXT`      | `pending` / `in_progress` / `done` / `failed` / `expired` / `skipped`. |
-| `download_error`    | `TEXT`      |                                                                       |
-| `download_attempts` | `INT`       |                                                                       |
-| `gcs_bucket`        | `TEXT`      | Set by the future downloader.                                         |
-| `gcs_object`        | `TEXT`      |                                                                       |
-| `local_path`        | `TEXT`      | Optional debug-only local path.                                       |
-| `is_voice_note`     | `BOOLEAN`   | True when audio is a PTT.                                             |
-| `waveform`          | `BYTEA`     |                                                                       |
-| `raw`               | `JSONB`     | Full nested message payload.                                          |
-| **Unique**          |             | `(account_id, chat_jid, message_id)`                                  |
-| **Indexes**         |             | partial index on `download_status IN ('pending','failed')`            |
+#### State machine
+
+```
+                         (worker claim)
+   pending  ──────────────────────────────►  in_progress
+     ▲                                            │
+     │ retry (transient,                          │ download +
+     │  with next_attempt_at                      │ upload OK
+     │   exponential backoff)                     ▼
+     │                                          done   ◄── terminal
+     │                                            
+     │ (lease expired,                          
+     │  reaper sweep)                          
+     │                                          
+   in_progress ◄─── (worker crashed)             
+     │                                            
+     │  too_large / type_disabled / decrypted_too_large
+     ├──────────────────────────────────────►  skipped ◄── terminal
+     │                                            
+     │  raw_message missing / non-transient       
+     │  download error / max_attempts reached     
+     └──────────────────────────────────────►  failed  ◄── terminal
+```
+
+#### Columns
+
+| Column              | Type           | Notes                                                                 |
+| ------------------- | -------------- | --------------------------------------------------------------------- |
+| `media_type`        | `TEXT`         | `image` / `video` / `audio` / `document` / `sticker` / `ptv` / `gif`. |
+| `mime_type`         | `TEXT`         | As declared in the WA proto.                                           |
+| `file_name`         | `TEXT`         | For documents.                                                        |
+| `file_length`       | `BIGINT`       | Encrypted-blob length from the WA proto. Used for early "too large" rejects. |
+| `width`/`height`    | `INT`          |                                                                       |
+| `duration_seconds`  | `INT`          | Audio, video.                                                         |
+| `page_count`        | `INT`          | Documents.                                                            |
+| `media_key`         | `BYTEA`        | AES key needed to decrypt the blob. Treat as secret.                  |
+| `file_sha256`       | `BYTEA`        |                                                                       |
+| `file_enc_sha256`   | `BYTEA`        |                                                                       |
+| `direct_path`/`url` | `TEXT`         | What you'd hand to `downloadMediaMessage`.                            |
+| `thumbnail`         | `BYTEA`        | Inline preview blob.                                                  |
+| `jpeg_thumbnail`    | `BYTEA`        | Smaller JPEG preview, when available.                                 |
+| `caption`           | `TEXT`         |                                                                       |
+| `download_status`   | `TEXT`         | `pending` / `in_progress` / `done` / `failed` / `skipped`. See state machine above. |
+| `download_error`    | `TEXT`         | Last failure reason (truncated to 500 chars).                         |
+| `download_attempts` | `INT`          | Incremented atomically when the worker claims the row.                |
+| `next_attempt_at`   | `TIMESTAMPTZ`  | When the row is eligible for the next claim (NOW() initially; bumped on transient failure with exponential backoff: 30s → 2m → 10m → 1h → 6h → 24h). |
+| `lease_until`       | `TIMESTAMPTZ`  | Set at claim time to NOW() + `MEDIA_LEASE_SECONDS`. NULL otherwise. The reaper restores rows whose lease expired. |
+| `worker_id`         | `TEXT`         | `<hostname>-<pid>` of the holder. Debug aid.                          |
+| `completed_at`      | `TIMESTAMPTZ`  | When `download_status` went to `done`.                                |
+| `size_bytes`        | `BIGINT`       | Verified post-download size. May differ from `file_length` (which is the encrypted-blob size). |
+| `content_type`      | `TEXT`         | Final content-type used when uploading the storage object.            |
+| `gcs_bucket`        | `TEXT`         | Set when `done`.                                                      |
+| `gcs_object`        | `TEXT`         | Object key inside the bucket. Pattern: `accounts/<accountId>/<chatJidSafe>/<messageId>.<ext>`. |
+| `gcs_url`           | `TEXT`         | Token-bearing public download URL from `getDownloadURL()`. Optional — the (bucket, object) pair is canonical. |
+| `local_path`        | `TEXT`         | Optional debug-only local path. Reserved for future `LocalDiskStorage`. |
+| `is_voice_note`     | `BOOLEAN`      | True when audio is a PTT.                                             |
+| `waveform`          | `BYTEA`        |                                                                       |
+| `raw`               | `JSONB`        | Full nested message payload.                                          |
+| **Unique**          |                | `(account_id, chat_jid, message_id)`                                  |
+| **Indexes**         |                | `media_ready_idx (next_attempt_at, account_id) WHERE status='pending'` (claim driver), `media_lease_expired_idx (lease_until) WHERE status='in_progress'` (reaper). |
+
+### `wa.media_processing`
+
+AI processing queue. Each row represents a single AI analysis job
+(video description, audio transcription, image description, or document
+parsing). Created automatically when `wa.media` reaches `download_status='done'`.
+
+Same `FOR UPDATE SKIP LOCKED` queue pattern as `wa.media`, with longer
+leases (10 min default) since AI calls are slower.
+
+| Column          | Type           | Notes                                                                 |
+| --------------- | -------------- | --------------------------------------------------------------------- |
+| `processor`     | `TEXT`         | `gemini_video`, `gemini_image`, `elevenlabs_audio`, `llamaparse_document`. |
+| `model`         | `TEXT`         | e.g. `gemini-2.5-flash`, `scribe_v2`, `agentic`.                     |
+| `prompt`        | `TEXT`         | The prompt sent to the AI (NULL for audio/document).                  |
+| `gcs_bucket`    | `TEXT`         | Denormalized from `wa.media` for the claim query.                    |
+| `gcs_object`    | `TEXT`         | Object key in Firebase Storage.                                       |
+| `status`        | `TEXT`         | `pending` / `in_progress` / `done` / `failed`.                       |
+| `error`         | `TEXT`         | Last failure reason.                                                  |
+| `attempts`      | `INT`          | Incremented at claim. Backoff: 1m, 5m, 30m, 2h.                     |
+| `result_text`   | `TEXT`         | The AI output: transcript, description markdown, or parsed markdown.  |
+| `result_meta`   | `JSONB`        | Token counts, model version, page count, language, etc.              |
+| `processing_ms` | `INT`          | Wall-clock time of the AI call.                                       |
+| **Unique**      |                | `(media_id, processor)` — prevents duplicate jobs.                   |
+| **Indexes**     |                | `media_processing_ready_idx`, `media_processing_lease_idx`, `media_processing_media_idx`. |
 
 ### `wa.message_receipts`
 

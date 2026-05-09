@@ -229,12 +229,50 @@ export const media = wa.table('media', {
 	downloadStatus: text('download_status').notNull().default('pending'),
 	downloadError: text('download_error'),
 	downloadAttempts: integer('download_attempts').notNull().default(0),
+	nextAttemptAt: timestamp('next_attempt_at', { withTimezone: true }).notNull().defaultNow(),
+	leaseUntil: timestamp('lease_until', { withTimezone: true }),
+	workerId: text('worker_id'),
+	completedAt: timestamp('completed_at', { withTimezone: true }),
+	sizeBytes: bigint('size_bytes', { mode: 'number' }),
+	contentType: text('content_type'),
 	gcsBucket: text('gcs_bucket'),
 	gcsObject: text('gcs_object'),
+	gcsUrl: text('gcs_url'),
 	localPath: text('local_path'),
 	isVoiceNote: boolean('is_voice_note'),
 	waveform: bytea('waveform'),
 	raw: jsonb('raw').notNull(),
+	insertedAt: timestamp('inserted_at', { withTimezone: true }).notNull().defaultNow(),
+	updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()
+})
+
+export const mediaProcessing = wa.table('media_processing', {
+	id: bigserial('id', { mode: 'bigint' }).primaryKey(),
+	accountId: uuid('account_id')
+		.notNull()
+		.references(() => accounts.id, { onDelete: 'cascade' }),
+	mediaId: bigint('media_id', { mode: 'bigint' })
+		.notNull()
+		.references(() => media.id, { onDelete: 'cascade' }),
+	chatJid: text('chat_jid').notNull(),
+	messageId: text('message_id').notNull(),
+	processor: text('processor').notNull(),
+	model: text('model').notNull(),
+	prompt: text('prompt'),
+	gcsBucket: text('gcs_bucket').notNull(),
+	gcsObject: text('gcs_object').notNull(),
+	mimeType: text('mime_type'),
+	sizeBytes: bigint('size_bytes', { mode: 'number' }),
+	status: text('status').notNull().default('pending'),
+	error: text('error'),
+	attempts: integer('attempts').notNull().default(0),
+	nextAttemptAt: timestamp('next_attempt_at', { withTimezone: true }).notNull().defaultNow(),
+	leaseUntil: timestamp('lease_until', { withTimezone: true }),
+	workerId: text('worker_id'),
+	resultText: text('result_text'),
+	resultMeta: jsonb('result_meta'),
+	processingMs: integer('processing_ms'),
+	completedAt: timestamp('completed_at', { withTimezone: true }),
 	insertedAt: timestamp('inserted_at', { withTimezone: true }).notNull().defaultNow(),
 	updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()
 })

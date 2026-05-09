@@ -18,11 +18,16 @@
     "render": "tsx src/render/index.ts"
   },
   "dependencies": {
+    "@elevenlabs/elevenlabs-js": "^2.46.0",
+    "@google/genai": "^1.52.0",
     "@hapi/boom": "^10.0.1",
+    "@llamaindex/llama-cloud": "^2.4.1",
     "baileys": "^7.0.0-rc10",
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",
+    "firebase-admin": "^13.8.0",
     "lru-cache": "^11.3.6",
+    "p-limit": "^7.3.0",
     "pino": "^10.3.1",
     "postgres": "^3.4.9",
     "qrcode-terminal": "^0.12.0"

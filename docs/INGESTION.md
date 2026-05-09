@@ -220,6 +220,179 @@ don't model: `blocklist.set`, `blocklist.update`, `call`,
 `message-capping.update`, `newsletter.*`, `group.join-request`,
 `group.member-tag.update`, `chats.lock`. Truncate freely.
 
+## Media pipeline (download → upload → persist)
+
+Every media-bearing message creates a `wa.media` row at ingestion with
+`download_status='pending'` (just metadata; bytes have not been touched
+yet). A long-running [`MediaWorker`](../src/store/media/worker.ts) drains
+that queue:
+
+```
+messages.upsert ─┐
+                 │ insert wa.media (status='pending')
+history sync ────┘
+                 │
+                 ▼
+         ChatStore.notify() ───► MediaWorker.notify() (wakes idle poll)
+                                          │
+                                          ▼
+       claim batch via FOR UPDATE SKIP LOCKED  (status pending → in_progress)
+                                          │
+                                          ▼
+       SELECT raw_envelope, raw_message FROM wa.messages   (rebuild WAMessage)
+                                          │
+                                          ▼
+            downloadMediaMessage(msg, 'buffer', {}, { reuploadRequest })
+                                          │
+                                          ▼
+                 Firebase Storage:  bucket.file(key).save(buffer)
+                                          │
+                                          ▼
+                  UPDATE wa.media SET status='done', gcs_*, size_bytes, content_type
+```
+
+### Why a Postgres queue and not Cloud Tasks / SQS / a separate broker?
+
+For a single-process bot, the queue's three jobs are: durability, retry,
+throttling. Postgres already gives us all three:
+
+- **Durable.** Rows live in the same DB as the message they reference;
+  no separate broker can drift out of sync.
+- **Atomic claim.** `UPDATE wa.media … FROM (SELECT … FOR UPDATE SKIP
+  LOCKED) AS ready` lets multiple workers (now or later) cooperate without
+  any explicit locking code.
+- **Backoff for free.** The next-attempt timestamp is just a column. No
+  delay queues, no DLQs, no extra infrastructure.
+- **Crash recovery.** Each claim stamps a `lease_until`; the worker
+  reaper sweeps expired leases at the start of every poll cycle and
+  resets them to `pending`.
+
+This pattern scales to **thousands of jobs/second** before lock contention
+becomes the bottleneck — orders of magnitude beyond what a WhatsApp bot
+will ever produce. If we ever cross that threshold, the same code adopts
+multiple workers transparently because of `SKIP LOCKED`.
+
+### Worker tuning knobs
+
+All sourced from env (see `.env.example`):
+
+| Setting                       | Default   | What it controls                                                       |
+| ----------------------------- | --------- | ---------------------------------------------------------------------- |
+| `MEDIA_DOWNLOAD_CONCURRENCY`  | 3         | Parallel `downloadOne()` calls. Bound by `p-limit`.                    |
+| `MEDIA_DOWNLOAD_BATCH_SIZE`   | 10        | Rows claimed per poll cycle.                                           |
+| `MEDIA_DOWNLOAD_POLL_MS`      | 5000      | Idle wait between polls. Worker also wakes immediately on `notify()`.  |
+| `MEDIA_LEASE_SECONDS`         | 120       | Time a claimed row stays in `in_progress` before reaper takes over.    |
+| `MEDIA_MAX_ATTEMPTS`          | 6         | Hard cap on retries before a row is marked `failed`.                   |
+| `MEDIA_MAX_BYTES`             | 100 MiB   | Pre-flight size guard. Larger media is `skipped`.                      |
+| `MEDIA_TYPES`                 | all 7     | Allow-list of types (`image,video,audio,document,sticker,ptv,gif`).    |
+
+### Failure modes and what they do
+
+| Symptom                              | Outcome              |
+| ------------------------------------ | -------------------- |
+| `downloadMediaMessage` 404/410       | Baileys auto-calls `reuploadRequest` (`sock.updateMediaMessage`); on success the download proceeds, on persistent failure → transient retry. |
+| Network/TLS error                    | Treated as transient (matched against patterns in `downloader.ts`). Backoff + retry. |
+| Crypto/decode error                  | Non-transient → row marked `failed` immediately.                       |
+| `raw_message` missing in DB          | Non-transient → `failed` (we can never decrypt without it).            |
+| `file_length` > `MEDIA_MAX_BYTES`    | `skipped` (pre-download).                                              |
+| Decrypted bytes > `MEDIA_MAX_BYTES`  | `skipped` (post-download).                                             |
+| Storage `noop` (no bucket configured) | Worker idles, never claims. Rows stay `pending`. Set `FIREBASE_STORAGE_BUCKET` and restart. |
+| Worker crashes mid-job               | Lease expires after `MEDIA_LEASE_SECONDS`; reaper resets row to `pending` on next poll. |
+
+### Object key layout
+
+```
+accounts/{accountId}/{chatJidSafe}/{messageId}.{ext}
+```
+
+- `accountId` — UUID from `wa.accounts.id` (multi-tenant safe).
+- `chatJidSafe` — JID with `@`, `:`, `/` replaced by `_`.
+- `messageId` — original WA message id (already URL-safe).
+- `ext` — derived from `mime_type` via a static map; falls back to a
+  per-`media_type` default (`jpg`, `mp4`, `ogg`, …).
+
+Idempotent: re-running a download for the same message overwrites the
+same path, never accumulating duplicates. The pair `(gcs_bucket,
+gcs_object)` is the canonical handle; `gcs_url` is just a convenience
+token-bearing URL from `getDownloadURL()` for clients that want to embed
+or share the file.
+
+### Operational queries
+
+```sql
+-- queue depth
+SELECT download_status, count(*) FROM wa.media GROUP BY 1;
+
+-- what's stuck
+SELECT id, chat_jid, message_id, media_type, download_attempts,
+       download_error, next_attempt_at
+FROM wa.media
+WHERE download_status = 'pending' AND next_attempt_at > NOW()
+ORDER BY next_attempt_at LIMIT 20;
+
+-- biggest uploads in the last day
+SELECT media_type, mime_type, size_bytes, gcs_object
+FROM wa.media
+WHERE download_status='done' AND completed_at > NOW() - interval '1 day'
+ORDER BY size_bytes DESC LIMIT 10;
+
+-- force-retry every failed row
+UPDATE wa.media
+SET download_status='pending', download_attempts=0,
+    next_attempt_at=NOW(), download_error=NULL
+WHERE download_status='failed';
+```
+
+## AI processing pipeline (post-download)
+
+After `downloadOne` marks a media row as `done`, it calls
+`enqueueProcessing()` which routes the media to an AI service based on
+`media_type`:
+
+| `media_type`          | Processor              | Model             | Input method          |
+| --------------------- | ---------------------- | ----------------- | --------------------- |
+| `video`, `ptv`, `gif` | `gemini_video`         | `gemini-2.5-flash` | `gs://` URI (zero I/O) |
+| `image`, `sticker`    | `gemini_image`         | `gemini-2.5-flash` | `gs://` URI (zero I/O) |
+| `audio`               | `elevenlabs_audio`     | `scribe_v2`       | Buffer download + upload |
+| `document`            | `llamaparse_document`  | `agentic` tier    | Buffer download + upload |
+
+The `ProcessingWorker` (same `FOR UPDATE SKIP LOCKED` pattern) claims
+jobs from `wa.media_processing` and routes to the appropriate handler in
+`src/store/processing/processors/`.
+
+### Key design points
+
+- **GCS URI passthrough for Gemini.** Videos and images are already in
+  Firebase Storage (= GCS). We pass `gs://{bucket}/{object}` directly as
+  `fileData.fileUri` — zero re-download, handles files up to 2 GB.
+- **Buffer download for ElevenLabs/LlamaParse.** These APIs need the
+  bytes uploaded. `MediaStorage.download(object)` fetches from GCS.
+- **Customizable prompts.** Defaults in `src/store/processing/prompts.ts`,
+  overridable via `PROCESSING_PROMPT_VIDEO` / `PROCESSING_PROMPT_IMAGE`.
+- **Longer leases.** AI processing is slow (10-min default lease vs 2-min
+  for downloads). Backoff schedule: 1m → 5m → 30m → 2h.
+- **Unique constraint** `(media_id, processor)` prevents duplicate jobs.
+
+### Operational queries
+
+```sql
+-- processing queue depth
+SELECT processor, status, count(*) FROM wa.media_processing GROUP BY 1, 2 ORDER BY 1, 2;
+
+-- recent completions with timing
+SELECT processor, model, processing_ms, length(result_text) AS chars,
+       completed_at
+FROM wa.media_processing
+WHERE status = 'done'
+ORDER BY completed_at DESC LIMIT 20;
+
+-- retry all failed processing
+UPDATE wa.media_processing
+SET status = 'pending', attempts = 0, next_attempt_at = NOW(),
+    error = NULL, lease_until = NULL, worker_id = NULL
+WHERE status = 'failed';
+```
+
 ## getMessage hot path
 
 Baileys calls `getMessage(key)` to:

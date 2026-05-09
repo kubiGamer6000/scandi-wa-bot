@@ -36,6 +36,11 @@ import type { StoreContext } from './types.js'
 
 const log = childLogger('store')
 
+/** Listener interface implemented by MediaWorker; lets ChatStore wake it up. */
+export interface MediaQueueListener {
+	notify(): void
+}
+
 /**
  * High-level facade around the WhatsApp message store.
  *
@@ -49,6 +54,7 @@ const log = childLogger('store')
 export class ChatStore {
 	private readonly cache = new MessageCache(2_000)
 	private readonly ctx: StoreContext
+	private mediaQueue: MediaQueueListener | null = null
 
 	private constructor(accountId: string) {
 		this.ctx = { accountId, db, log }
@@ -61,6 +67,11 @@ export class ChatStore {
 
 	get accountId(): string {
 		return this.ctx.accountId
+	}
+
+	/** Register a listener that wants to be notified when new media is enqueued. */
+	bindMediaQueue(listener: MediaQueueListener): void {
+		this.mediaQueue = listener
 	}
 
 	/**
@@ -110,14 +121,23 @@ export class ChatStore {
 		})
 
 		ev.on('messaging-history.set', payload => {
-			void this.run('messaging-history.set', () => handleHistorySet(this.ctx, payload, this.cache))
+			void this.run('messaging-history.set', async () => {
+				await handleHistorySet(this.ctx, payload, this.cache)
+				this.mediaQueue?.notify()
+			})
 		})
 		ev.on('messaging-history.status', payload => {
 			void this.run('messaging-history.status', () => handleHistoryStatus(this.ctx, payload))
 		})
 
 		ev.on('messages.upsert', payload => {
-			void this.run('messages.upsert', () => upsertMessages(this.ctx, payload.messages, this.cache))
+			void this.run('messages.upsert', async () => {
+				await upsertMessages(this.ctx, payload.messages, this.cache)
+				// Best-effort wake of the media worker. We don't know without a
+				// query whether any new media rows were inserted, but a spurious
+				// wake costs one DB poll which the worker already does anyway.
+				this.mediaQueue?.notify()
+			})
 		})
 		ev.on('messages.update', list => {
 			void this.run('messages.update', () => handleMessageUpdates(this.ctx, list))
