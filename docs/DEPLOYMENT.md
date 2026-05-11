@@ -120,11 +120,23 @@ Then create a non-root user the bot will run as:
 
 ```bash
 useradd -m -s /bin/bash -G sudo scandi
+
+# IMPORTANT: set a password so `sudo` works. `useradd` does NOT prompt for
+# one, and without it the account is locked for password auth — meaning
+# every `sudo` call will fail with "incorrect password" even though you can
+# still SSH in via your key. Recovering from this requires the VPS provider's
+# web console, so don't skip this line.
+passwd scandi
+
 mkdir -p /home/scandi/.ssh
 cp /root/.ssh/authorized_keys /home/scandi/.ssh/authorized_keys
 chown -R scandi:scandi /home/scandi/.ssh
 chmod 700 /home/scandi/.ssh
 chmod 600 /home/scandi/.ssh/authorized_keys
+
+# Sanity check BEFORE locking root: open a second terminal, run
+#   ssh scandi@<droplet-ip>
+# and confirm `sudo -v` accepts the password you just set. Only then proceed.
 
 # Lock root SSH and disable password auth.
 sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
