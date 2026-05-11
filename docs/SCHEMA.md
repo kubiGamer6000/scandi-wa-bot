@@ -11,6 +11,7 @@ them.
 | `0002_auth_state.sql`             | Postgres-backed Baileys auth: `auth_creds`, `auth_keys`. |
 | `0003_media_queue.sql`            | Queue columns on `wa.media` (`next_attempt_at`, `lease_until`, `completed_at`, `size_bytes`, `content_type`, `gcs_url`, claim/lease indexes). |
 | `0004_media_processing.sql`      | AI processing queue: `wa.media_processing` with claim/lease indexes, unique constraint on `(media_id, processor)`. |
+| `0005_api_layer.sql`             | HTTP API support: `seq BIGSERIAL` on `wa.messages` (public message ID), `wa.webhook_subscriptions`, `wa.webhook_deliveries` (third durable queue with claim/lease indexes). |
 
 Apply with:
 
@@ -353,6 +354,42 @@ leases (10 min default) since AI calls are slower.
 | `processing_ms` | `INT`          | Wall-clock time of the AI call.                                       |
 | **Unique**      |                | `(media_id, processor)` — prevents duplicate jobs.                   |
 | **Indexes**     |                | `media_processing_ready_idx`, `media_processing_lease_idx`, `media_processing_media_idx`. |
+
+### `wa.webhook_subscriptions`
+
+DB-stored webhook destinations managed via the HTTP API (`POST /v1/webhooks`).
+Each row is one external consumer (typically an AI agent).
+
+| Column         | Type        | Notes                                                                 |
+| -------------- | ----------- | --------------------------------------------------------------------- |
+| `id`           | `UUID PK`   | Stable opaque identifier returned to clients.                         |
+| `account_id`   | `UUID`      | FK to `wa.accounts`.                                                  |
+| `url`          | `TEXT`      | POST target.                                                          |
+| `secret`       | `TEXT`      | HMAC-SHA256 secret. Auto-generated if not provided on create.         |
+| `event_types`  | `TEXT[]`    | Filter array: `message.received`, `message.edited`, etc.              |
+| `active`       | `BOOLEAN`   | Soft-disable without deleting.                                        |
+| `description`  | `TEXT`      | Free-form label for ops.                                              |
+
+### `wa.webhook_deliveries`
+
+Third durable Postgres queue (same pattern as `wa.media` / `wa.media_processing`).
+The `WebhookWorker` drains via `FOR UPDATE SKIP LOCKED` with the
+30s → 2m → 10m → 1h → 6h → 24h backoff schedule.
+
+| Column            | Type          | Notes                                                                 |
+| ----------------- | ------------- | --------------------------------------------------------------------- |
+| `id`              | `BIGSERIAL`   |                                                                       |
+| `subscription_id` | `UUID FK`     | `wa.webhook_subscriptions(id)`.                                       |
+| `event_type`      | `TEXT`        | Mirrors the bus event type.                                           |
+| `payload`         | `JSONB`       | Full payload built at enqueue time — snapshot of state then.          |
+| `status`          | `TEXT`        | `pending` → `in_progress` → `delivered` / `abandoned`.                |
+| `attempts`        | `INT`         |                                                                       |
+| `next_attempt_at` | `TIMESTAMPTZ` | Claim eligibility.                                                    |
+| `lease_until`     | `TIMESTAMPTZ` | Reaped by the worker on startup / each poll.                          |
+| `last_status_code`| `INT`         | Last HTTP response code (0 on network error).                         |
+| `last_error`      | `TEXT`        | Truncated to 500 chars.                                               |
+| `delivered_at`    | `TIMESTAMPTZ` | When the 2xx response arrived.                                        |
+| **Indexes**       |               | `webhook_deliv_ready_idx`, `webhook_deliv_lease_idx`, `webhook_deliv_sub_idx`. |
 
 ### `wa.message_receipts`
 

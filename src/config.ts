@@ -51,6 +51,34 @@ export interface AppConfig {
 	readonly allowedJids: readonly string[]
 	readonly media: MediaConfig
 	readonly processing: ProcessingConfig
+	readonly api: ApiConfig
+	readonly webhooks: WebhookConfig
+}
+
+export interface ApiConfig {
+	readonly enabled: boolean
+	/** Bind address. 127.0.0.1 by default — reverse-proxy via Nginx/Caddy for TLS. */
+	readonly host: string
+	readonly port: number
+	/** Bearer token clients must send in Authorization. Required when `enabled`. */
+	readonly authToken: string | null
+	/** Cap on inbound request bodies (multipart for media uploads). */
+	readonly maxBodyBytes: number
+}
+
+export interface WebhookConfig {
+	/** Number of deliveries in flight at once. */
+	readonly concurrency: number
+	/** Rows claimed per poll cycle. */
+	readonly batchSize: number
+	/** Idle poll interval. Worker also wakes when a new delivery is enqueued. */
+	readonly pollIntervalMs: number
+	/** How long the worker holds a delivery's lease before re-claim. */
+	readonly leaseSeconds: number
+	/** Cap on attempts before a delivery is marked terminally abandoned. */
+	readonly maxAttempts: number
+	/** Per-request HTTP timeout. */
+	readonly timeoutMs: number
 }
 
 export interface MediaConfig {
@@ -113,6 +141,22 @@ const buildMediaConfig = (): MediaConfig => {
 	}
 }
 
+export type LlamaParseTier = 'fast' | 'cost_effective' | 'agentic' | 'agentic_plus'
+const LLAMAPARSE_TIERS: readonly LlamaParseTier[] = [
+	'fast',
+	'cost_effective',
+	'agentic',
+	'agentic_plus'
+]
+
+const parseLlamaParseTier = (raw: string | undefined): LlamaParseTier => {
+	const v = raw?.trim() || 'agentic'
+	if ((LLAMAPARSE_TIERS as readonly string[]).includes(v)) return v as LlamaParseTier
+	throw new Error(
+		`Invalid PROCESSING_LLAMAPARSE_TIER='${v}'. Valid: ${LLAMAPARSE_TIERS.join(', ')}`
+	)
+}
+
 export interface ProcessingConfig {
 	readonly enabled: boolean
 	readonly geminiApiKey: string | null
@@ -120,7 +164,7 @@ export interface ProcessingConfig {
 	readonly elevenlabsApiKey: string | null
 	readonly elevenlabsModel: string
 	readonly llamaCloudApiKey: string | null
-	readonly llamaParseTier: string
+	readonly llamaParseTier: LlamaParseTier
 	readonly concurrency: number
 	readonly batchSize: number
 	readonly pollIntervalMs: number
@@ -145,7 +189,7 @@ const buildProcessingConfig = (): ProcessingConfig => {
 		elevenlabsApiKey,
 		elevenlabsModel: process.env.PROCESSING_MODEL_AUDIO?.trim() || 'scribe_v2',
 		llamaCloudApiKey,
-		llamaParseTier: process.env.PROCESSING_LLAMAPARSE_TIER?.trim() || 'agentic',
+		llamaParseTier: parseLlamaParseTier(process.env.PROCESSING_LLAMAPARSE_TIER),
 		concurrency: Math.max(1, parseIntEnv(process.env.PROCESSING_CONCURRENCY, 2)),
 		batchSize: Math.max(1, parseIntEnv(process.env.PROCESSING_BATCH_SIZE, 5)),
 		pollIntervalMs: Math.max(1000, parseIntEnv(process.env.PROCESSING_POLL_MS, 10_000)),
@@ -155,6 +199,30 @@ const buildProcessingConfig = (): ProcessingConfig => {
 		promptImage: process.env.PROCESSING_PROMPT_IMAGE?.trim() || null
 	}
 }
+
+const buildApiConfig = (): ApiConfig => {
+	const enabled = parseBool(process.env.API_ENABLED, false)
+	const authToken = process.env.API_AUTH_TOKEN?.trim() || null
+	if (enabled && !authToken) {
+		throw new Error('API_ENABLED=true but API_AUTH_TOKEN is empty. Refuse to start an unauthenticated API.')
+	}
+	return {
+		enabled,
+		host: process.env.API_HOST?.trim() || '127.0.0.1',
+		port: Math.max(1, parseIntEnv(process.env.API_PORT, 8787)),
+		authToken,
+		maxBodyBytes: Math.max(1, parseIntEnv(process.env.API_MAX_BODY_MB, 25)) * 1024 * 1024
+	}
+}
+
+const buildWebhookConfig = (): WebhookConfig => ({
+	concurrency: Math.max(1, parseIntEnv(process.env.WEBHOOK_CONCURRENCY, 4)),
+	batchSize: Math.max(1, parseIntEnv(process.env.WEBHOOK_BATCH_SIZE, 10)),
+	pollIntervalMs: Math.max(500, parseIntEnv(process.env.WEBHOOK_POLL_MS, 5_000)),
+	leaseSeconds: Math.max(15, parseIntEnv(process.env.WEBHOOK_LEASE_SECONDS, 60)),
+	maxAttempts: Math.max(1, parseIntEnv(process.env.WEBHOOK_MAX_ATTEMPTS, 6)),
+	timeoutMs: Math.max(1000, parseIntEnv(process.env.WEBHOOK_TIMEOUT_MS, 10_000))
+})
 
 const browserPlatformRaw = (process.env.BROWSER_PLATFORM ?? 'Ubuntu').trim()
 const browserPlatform: AppConfig['browser']['platform'] =
@@ -176,5 +244,7 @@ export const config: AppConfig = {
 	markOnlineOnConnect: parseBool(process.env.MARK_ONLINE_ON_CONNECT, false),
 	allowedJids: parseList(process.env.ALLOWED_JIDS),
 	media: buildMediaConfig(),
-	processing: buildProcessingConfig()
+	processing: buildProcessingConfig(),
+	api: buildApiConfig(),
+	webhooks: buildWebhookConfig()
 }

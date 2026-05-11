@@ -148,50 +148,23 @@ entirely. No action needed; this is automatic.
 | Recon   | `npm run recon`  | Dump raw Baileys events to `data/recon/<date>/*.jsonl`. |
 | Render  | `npm run render -- <phone-or-jid> [out.md]` | Markdown export. |
 
-## Deployment (Ubuntu / DigitalOcean)
+## Deployment
 
-A simple, robust setup:
+For the full, production-ready DigitalOcean droplet runbook (host
+hardening, systemd unit with sandboxing, atomic deploy script, QR
+pairing, log retention, troubleshooting), see
+[**`docs/DEPLOYMENT.md`**](./DEPLOYMENT.md).
 
-- Run under a process supervisor (`systemd`, `pm2`, or similar). The bot
-  exits with code `1` on permanent `loggedOut` so the supervisor can
-  restart it; on transient drops it reconnects internally.
-- The session lives in Postgres (`wa.auth_creds` + `wa.auth_keys`) — back
+Highlights:
+
+- Bot exits with code `1` on permanent `loggedOut` so the supervisor
+  restarts it (and prints a fresh QR); transient drops are handled
+  internally and never exit.
+- Session lives in Postgres (`wa.auth_creds` + `wa.auth_keys`) — back
   up the DB, not the host. Losing those rows forces a fresh QR pair.
-  The `data/` folder no longer carries any state for new installs.
-- Make sure outbound TCP 443 to `web.whatsapp.com` is open.
-- Pin `node` to ≥ 20 (Baileys 7 requirement).
-
-Example systemd unit:
-
-```ini
-[Unit]
-Description=scandi-wa-bot
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=scandi
-WorkingDirectory=/opt/scandi-wa-bot
-EnvironmentFile=/opt/scandi-wa-bot/.env
-ExecStart=/usr/bin/node dist/index.js
-Restart=always
-RestartSec=5
-
-# Hard-fail safety
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-npm run build
-sudo systemctl daemon-reload
-sudo systemctl enable --now scandi-wa-bot
-journalctl -u scandi-wa-bot -f
-```
+- Outbound TCP 443 must be open (WhatsApp, Supabase, Firebase, Gemini,
+  ElevenLabs, LlamaCloud).
+- Node ≥ 20 (Baileys 7 requirement).
 
 ## What to monitor
 

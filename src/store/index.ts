@@ -32,6 +32,7 @@ import {
 	updateSyncState
 } from './handlers/misc.js'
 import { handleReactions, invalidateSelfCache } from './handlers/reactions.js'
+import { MessageBus } from './bus.js'
 import type { StoreContext } from './types.js'
 
 const log = childLogger('store')
@@ -55,9 +56,11 @@ export class ChatStore {
 	private readonly cache = new MessageCache(2_000)
 	private readonly ctx: StoreContext
 	private mediaQueue: MediaQueueListener | null = null
+	private readonly _bus: MessageBus
 
 	private constructor(accountId: string) {
-		this.ctx = { accountId, db, log }
+		this._bus = new MessageBus(log)
+		this.ctx = { accountId, db, log, bus: this._bus }
 	}
 
 	static async open(): Promise<ChatStore> {
@@ -67,6 +70,11 @@ export class ChatStore {
 
 	get accountId(): string {
 		return this.ctx.accountId
+	}
+
+	/** In-process event bus. Webhook enqueuer + future consumers subscribe here. */
+	get bus(): MessageBus {
+		return this._bus
 	}
 
 	/** Register a listener that wants to be notified when new media is enqueued. */

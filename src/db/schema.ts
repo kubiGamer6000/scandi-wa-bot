@@ -135,6 +135,12 @@ export const messages = wa.table(
 			.references(() => accounts.id, { onDelete: 'cascade' }),
 		chatJid: text('chat_jid').notNull(),
 		id: text('id').notNull(),
+		/**
+		 * Globally-unique monotonic ID. Backfilled for existing rows at the
+		 * 0005 migration; new rows get the next value from the sequence
+		 * automatically. Used as the public message ID in the HTTP API.
+		 */
+		seq: bigserial('seq', { mode: 'number' }).notNull(),
 		fromMe: boolean('from_me').notNull(),
 		participant: text('participant'),
 		senderPn: text('sender_pn'),
@@ -360,6 +366,48 @@ export const eventLog = wa.table('event_log', {
 	event: text('event').notNull(),
 	payload: jsonb('payload').notNull(),
 	ts: timestamp('ts', { withTimezone: true }).notNull().defaultNow()
+})
+
+/**
+ * Webhook destination registered through the HTTP API (`POST /v1/webhooks`).
+ * Each row is one consumer (typically an AI agent service); the bot fans out
+ * matching events into `webhook_deliveries` for durable, retried POSTs.
+ */
+export const webhookSubscriptions = wa.table('webhook_subscriptions', {
+	id: uuid('id').primaryKey().defaultRandom(),
+	accountId: uuid('account_id')
+		.notNull()
+		.references(() => accounts.id, { onDelete: 'cascade' }),
+	url: text('url').notNull(),
+	secret: text('secret').notNull(),
+	eventTypes: text('event_types').array().notNull(),
+	active: boolean('active').notNull().default(true),
+	description: text('description'),
+	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+	updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()
+})
+
+/**
+ * Durable webhook delivery queue, drained by `WebhookWorker` with
+ * `FOR UPDATE SKIP LOCKED` + exponential backoff. At-least-once semantics.
+ */
+export const webhookDeliveries = wa.table('webhook_deliveries', {
+	id: bigserial('id', { mode: 'bigint' }).primaryKey(),
+	subscriptionId: uuid('subscription_id')
+		.notNull()
+		.references(() => webhookSubscriptions.id, { onDelete: 'cascade' }),
+	eventType: text('event_type').notNull(),
+	payload: jsonb('payload').notNull(),
+	status: text('status').notNull().default('pending'),
+	attempts: integer('attempts').notNull().default(0),
+	nextAttemptAt: timestamp('next_attempt_at', { withTimezone: true }).notNull().defaultNow(),
+	leaseUntil: timestamp('lease_until', { withTimezone: true }),
+	workerId: text('worker_id'),
+	lastStatusCode: integer('last_status_code'),
+	lastError: text('last_error'),
+	deliveredAt: timestamp('delivered_at', { withTimezone: true }),
+	insertedAt: timestamp('inserted_at', { withTimezone: true }).notNull().defaultNow(),
+	updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()
 })
 
 /**

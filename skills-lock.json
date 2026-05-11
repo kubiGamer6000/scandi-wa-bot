@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "llamaparse": {
+      "source": "run-llama/llamaparse-agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/llamaparse/SKILL.md",
+      "computedHash": "43e155be048b413a47c4f9966da586c2c1ef09b068146dc5dd0ccda966410ca4"
+    }
+  }
+}

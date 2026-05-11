@@ -5,17 +5,19 @@ designed to run long-lived on a single host (e.g. an Ubuntu droplet on
 DigitalOcean) and serve as the foundation for scheduled report delivery,
 message-based commands, and downstream LLM agents.
 
-The bot does three things today:
+The bot does four things today:
 
-1. **Listens** to a WhatsApp account paired via QR (or pairing code) and
-   responds to incoming messages (`Hello World` quote-reply for now).
+1. **Listens** to a WhatsApp account paired via QR (or pairing code).
 2. **Persists** every chat, contact, message, edit, deletion, reaction, media
    reference, group state, and sync watermark into a PostgreSQL database
    under the `wa` schema. The store mirrors what a full WhatsApp Web client
    would keep, with idempotent upserts so history-sync re-runs are no-ops.
-3. **Renders** any conversation back to a clean Markdown file (`npm run render`),
-   suitable for feeding into LLM agents (LangGraph etc.) as conversation
-   context.
+3. **Processes** media via AI (Gemini for image/video, ElevenLabs for audio,
+   LlamaParse for documents), so every media row gets a searchable
+   text/transcript/markdown projection.
+4. **Exposes** an HTTP API for AI agents and cron jobs to read chat history,
+   send / react / edit / delete messages, fetch media, and subscribe to
+   durable HMAC-signed webhooks. See [`docs/API.md`](docs/API.md).
 
 The bot survives reconnects, app restarts, history-sync overlap, message
 edits, and deletions without losing data.
@@ -79,7 +81,9 @@ npm run render -- +359884430293
 | [`docs/SCHEMA.md`](docs/SCHEMA.md)             | Every table in `wa.*`, with columns, indexes, FKs, invariants, ER diagram.          |
 | [`docs/INGESTION.md`](docs/INGESTION.md)       | Baileys event → table mapping; LID handling; edits; deletions; reactions; sync.     |
 | [`docs/RENDERER.md`](docs/RENDERER.md)         | How `npm run render` works; PN/LID JID merging; Markdown format spec.               |
-| [`docs/OPERATIONS.md`](docs/OPERATIONS.md)     | Setup, deployment, monitoring, troubleshooting, common ops queries.                 |
+| [`docs/OPERATIONS.md`](docs/OPERATIONS.md)     | Setup, monitoring, troubleshooting, common ops queries.                             |
+| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)     | Production runbook: DigitalOcean droplet, hardening, systemd, atomic deploys.       |
+| [`docs/API.md`](docs/API.md)                   | Full external integration guide: WhatsApp/Baileys primer, every endpoint, webhook contract & signing, media model, integration recipes, error catalog. |
 
 ## Status, scope, what isn't built yet
 
@@ -113,9 +117,18 @@ npm run render -- +359884430293
   - **Documents** → LlamaParse (PDF/DOCX/XLSX → clean Markdown)
   - Customizable prompts, exponential backoff, crash recovery.
   - Results stored as text in `wa.media_processing.result_text`.
+- **HTTP API + webhook layer:** Fastify server on the same process as
+  the socket. Bearer-auth, TypeBox-validated routes for chats/messages/
+  send/react/edit/delete, durable HMAC-signed webhooks backed by a third
+  Postgres queue (`wa.webhook_deliveries`) with the same `FOR UPDATE SKIP
+  LOCKED` worker pattern. See [`docs/API.md`](docs/API.md).
 
 **Not yet built (deliberately):**
 
+- LLM tool wrappers around the HTTP API (a separate layer, deferred).
+- Multi-tenant API keys / per-key scopes / rate limiting.
+- Inbound media proxy streaming optimisations (v1 buffers in memory).
+- Calls (`call.*`), presence updates, SSE/WebSocket push.
 - Scheduled report delivery (cron jobs that pull from internal API and
   message a chat at a fixed time).
 - Telegram bridge for re-auth notifications when the WA session drops.

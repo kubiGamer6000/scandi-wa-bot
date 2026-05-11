@@ -230,6 +230,21 @@ export const upsertMessages = async (
 		}
 	}
 
+	// Publish to the in-process bus AFTER all writes complete. We only emit
+	// `message.received` for rows that carry real content (raw_message != null);
+	// pure tombstones / pure reactionMessages have already triggered their
+	// own bus events from the revoke / reaction code paths.
+	for (const p of all) {
+		if (!p.rawMessage) continue
+		if (p.reaction) continue
+		ctx.bus.emit({
+			type: 'message.received',
+			chatJid: p.chatJid,
+			messageId: p.row.id,
+			fromMe: !!p.row.fromMe
+		})
+	}
+
 	log.debug(
 		{
 			n: all.length,
@@ -247,10 +262,11 @@ export const upsertMessages = async (
  * later history sync chunks can backfill the body.
  */
 const applyRevoke = async (
-	{ accountId, db, log }: StoreContext,
+	ctx: StoreContext,
 	target: { chatJid: string; id: string; revokerJid: string | null }
 ): Promise<void> => {
-	await ensureChatsExist({ accountId, db, log }, [target.chatJid])
+	const { accountId, db, log } = ctx
+	await ensureChatsExist(ctx, [target.chatJid])
 	await db
 		.insert(messagesTbl)
 		.values({
@@ -274,6 +290,7 @@ const applyRevoke = async (
 				tombstone: sql`TRUE`
 			}
 		})
+	ctx.bus.emit({ type: 'message.deleted', chatJid: target.chatJid, messageId: target.id })
 	log.debug({ chatJid: target.chatJid, id: target.id }, 'message revoked')
 }
 
@@ -283,9 +300,10 @@ const applyRevoke = async (
  * is snapshotted into `wa.message_edits` and the live row is overwritten.
  */
 export const handleMessageUpdates = async (
-	{ accountId, db, log }: StoreContext,
+	ctx: StoreContext,
 	updates: WAMessageUpdate[]
 ): Promise<void> => {
+	const { accountId, db, log } = ctx
 	for (const u of updates) {
 		const chatJid = u.key.remoteJid
 		const id = u.key.id
@@ -345,6 +363,9 @@ export const handleMessageUpdates = async (
 				.where(
 					sql`${messagesTbl.accountId} = ${accountId} AND ${messagesTbl.chatJid} = ${chatJid} AND ${messagesTbl.id} = ${id}`
 				)
+			if (isContentEdit && 'editCount' in updatedFields) {
+				ctx.bus.emit({ type: 'message.edited', chatJid, messageId: id })
+			}
 			log.debug({ chatJid, id, fields: Object.keys(updatedFields) }, 'message updated')
 		}
 	}
@@ -395,6 +416,7 @@ export const handleMessageDeletes = async (
 					tombstone: sql`TRUE`
 				}
 			})
+		ctx.bus.emit({ type: 'message.deleted', chatJid: k.remoteJid, messageId: k.id })
 	}
 	log.debug({ n: payload.keys.length }, 'messages deleted')
 }

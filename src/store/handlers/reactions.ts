@@ -29,9 +29,10 @@ const toDateFromMs = (v: number | Long | null | undefined): Date => {
  *   - reaction.senderTimestampMs is preferred over the WAMessageKey timestamp
  */
 export const handleReactions = async (
-	{ accountId, db, log }: StoreContext,
+	ctx: StoreContext,
 	events: Array<{ key: WAMessageKey; reaction: proto.IReaction }>
 ): Promise<void> => {
+	const { accountId, db, log } = ctx
 	for (const ev of events) {
 		const chatJid = ev.key.remoteJid
 		const messageId = ev.key.id
@@ -48,6 +49,7 @@ export const handleReactions = async (
 				target: [reactions.accountId, reactions.chatJid, reactions.messageId, reactions.actorJid],
 				set: { emoji: sql`EXCLUDED.emoji`, ts: sql`EXCLUDED.ts` }
 			})
+		ctx.bus.emit({ type: 'message.reacted', chatJid, messageId, actorJid, emoji })
 	}
 	log.debug({ n: events.length }, 'reactions persisted')
 }
@@ -141,6 +143,13 @@ export const recordInlineReaction = async (
 				ts: sql`GREATEST(${reactions.ts}, EXCLUDED.ts)`
 			}
 		})
+	ctx.bus.emit({
+		type: 'message.reacted',
+		chatJid: input.chatJid,
+		messageId: input.targetId,
+		actorJid,
+		emoji: input.emoji
+	})
 	ctx.log.debug(
 		{ chat: input.chatJid, target: input.targetId, actor: actorJid, emoji: input.emoji },
 		'inline reaction recorded'

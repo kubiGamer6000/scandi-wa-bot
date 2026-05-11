@@ -7,13 +7,17 @@ import makeWASocket, {
 	type WASocket
 } from 'baileys'
 import qrcode from 'qrcode-terminal'
+import type { FastifyInstance } from 'fastify'
 
 import { loadAuthState, type AuthHandle } from './auth.js'
 import { config } from './config.js'
 import { childLogger, logger } from './logger.js'
 import { ChatStore } from './store/index.js'
-import { buildMediaStorage, MediaWorker } from './store/media/index.js'
+import { buildMediaStorage, MediaWorker, type MediaStorage } from './store/media/index.js'
 import { ProcessingWorker } from './store/processing/index.js'
+import { buildServer } from './api/server.js'
+import { WebhookWorker } from './webhooks/worker.js'
+import { bindWebhookEnqueuer } from './webhooks/enqueue.js'
 import { db } from './db/index.js'
 
 const log = childLogger('bot')
@@ -48,9 +52,18 @@ export class Bot {
 	private auth: AuthHandle | undefined
 	private mediaWorker: MediaWorker | undefined
 	private processingWorker: ProcessingWorker | undefined
+	private webhookWorker: WebhookWorker | undefined
+	private apiServer: FastifyInstance | undefined
+	private mediaStorage: MediaStorage | undefined
+	private detachWebhookEnqueuer: (() => void) | undefined
 
 	/** Cached group metadata to avoid a USync request on every group send. */
 	private readonly groupCache = new Map<string, GroupMetadata>()
+
+	/** Exposed so the API send route can hold a closure that follows reconnects. */
+	getSock(): WASocket | null {
+		return this.sock ?? null
+	}
 
 	async start(): Promise<void> {
 		this.store = await ChatStore.open()
@@ -62,8 +75,14 @@ export class Bot {
 		// Media downloader runs as an independent worker, polling wa.media for
 		// rows in 'pending' status. The store wakes it up after every upsert.
 		const storage = buildMediaStorage(config.media.firebase)
+		this.mediaStorage = storage
 		this.mediaWorker = new MediaWorker(
-			{ accountId: this.store.accountId, db, log: childLogger('store:media') },
+			{
+				accountId: this.store.accountId,
+				db,
+				log: childLogger('store:media'),
+				bus: this.store.bus
+			},
 			storage,
 			config.media
 		)
@@ -74,20 +93,64 @@ export class Bot {
 		// AI processing worker: drains wa.media_processing after media
 		// download completes. Routes to Gemini / ElevenLabs / LlamaParse.
 		this.processingWorker = new ProcessingWorker(
-			{ accountId: this.store.accountId, db, log: childLogger('store:processing') },
+			{
+				accountId: this.store.accountId,
+				db,
+				log: childLogger('store:processing'),
+				bus: this.store.bus
+			},
 			storage,
 			config.processing
 		)
 		this.processingWorker.start()
 
+		// HTTP API + webhook plumbing. Both pieces depend on the live socket
+		// and the chat store; we wire them BEFORE Baileys connects so they
+		// can stream history-sync events too once messaging starts flowing.
+		if (config.api.enabled) {
+			this.webhookWorker = new WebhookWorker(config.webhooks)
+			this.detachWebhookEnqueuer = bindWebhookEnqueuer(this.store, this.webhookWorker)
+			this.webhookWorker.start()
+
+			this.apiServer = await buildServer({
+				getSock: () => this.sock ?? null,
+				store: this.store,
+				storage: this.mediaStorage
+			})
+			const addr = await this.apiServer.listen({
+				host: config.api.host,
+				port: config.api.port
+			})
+			log.info({ addr }, 'api server listening')
+		} else {
+			log.info('api server disabled (set API_ENABLED=true to enable)')
+		}
+
 		await this.connect()
 	}
 
-	/** Cleanly close the socket. Idempotent. */
+	/** Cleanly close everything. Idempotent. Order matters:
+	 *
+	 *   1. API server first — drain inflight requests so callers see clean
+	 *      EOF instead of half-completed sendMessage calls.
+	 *   2. Detach the webhook enqueuer so no further bus events fan out.
+	 *   3. Stop the WhatsApp socket — no new events from this point.
+	 *   4. Stop the workers, which may still be flushing in-flight jobs.
+	 */
 	async stop(): Promise<void> {
 		if (this.shuttingDown) return
 		this.shuttingDown = true
 		log.info('shutting down')
+		try {
+			await this.apiServer?.close()
+		} catch (err) {
+			log.warn({ err }, 'error closing api server (ignored)')
+		}
+		try {
+			this.detachWebhookEnqueuer?.()
+		} catch (err) {
+			log.warn({ err }, 'error detaching webhook enqueuer (ignored)')
+		}
 		try {
 			await this.sock?.end(undefined)
 		} catch (err) {
@@ -102,6 +165,11 @@ export class Bot {
 			await this.processingWorker?.stop()
 		} catch (err) {
 			log.warn({ err }, 'error stopping processing worker (ignored)')
+		}
+		try {
+			await this.webhookWorker?.stop()
+		} catch (err) {
+			log.warn({ err }, 'error stopping webhook worker (ignored)')
 		}
 	}
 

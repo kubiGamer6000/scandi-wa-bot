@@ -216,6 +216,13 @@ export class ProcessingWorker {
 				WHERE id = ${BigInt(claim.id)}
 			`)
 
+			this.ctx.bus.emit({
+				type: 'message.processed',
+				chatJid: claim.chat_jid,
+				messageId: claim.message_id,
+				processor: claim.processor
+			})
+
 			log.info(
 				{
 					id: claim.id,
