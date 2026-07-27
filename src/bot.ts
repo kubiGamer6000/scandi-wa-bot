@@ -15,6 +15,7 @@ import { childLogger, logger } from './logger.js'
 import { ChatStore } from './store/index.js'
 import { buildMediaStorage, MediaWorker, type MediaStorage } from './store/media/index.js'
 import { ProcessingWorker } from './store/processing/index.js'
+import { ReadReceiptWorker, TypingManager } from './presence/index.js'
 import { buildServer } from './api/server.js'
 import { WebhookWorker } from './webhooks/worker.js'
 import { bindWebhookEnqueuer } from './webhooks/enqueue.js'
@@ -60,9 +61,23 @@ export class Bot {
 	/** Cached group metadata to avoid a USync request on every group send. */
 	private readonly groupCache = new Map<string, GroupMetadata>()
 
+	/** Acks inbound messages so DMs and groups don't sit unread. */
+	private readonly readReceipts = new ReadReceiptWorker(config.readReceipts)
+
+	/** Holds "typing…" open in a chat while a consumer works on a reply. */
+	private readonly typing = new TypingManager(
+		config.typing,
+		config.markOnlineOnConnect ? 'available' : 'unavailable'
+	)
+
 	/** Exposed so the API send route can hold a closure that follows reconnects. */
 	getSock(): WASocket | null {
 		return this.sock ?? null
+	}
+
+	/** Exposed for the presence API routes, which drive typing indicators. */
+	getTyping(): TypingManager {
+		return this.typing
 	}
 
 	async start(): Promise<void> {
@@ -90,6 +105,20 @@ export class Bot {
 		this.store.bindMediaQueue(this.mediaWorker)
 		this.mediaWorker.start()
 
+		// Presence side-effects (read receipts + typing) talk to the socket
+		// directly and survive reconnects via the same getter indirection.
+		this.readReceipts.bindSocket(() => this.sock ?? null)
+		this.typing.bindSocket(() => this.sock ?? null)
+		log.info(
+			{
+				readReceipts: config.readReceipts.enabled,
+				readReceiptJids: config.readReceipts.jids,
+				typing: config.typing.enabled,
+				typingRefreshMs: config.typing.refreshMs
+			},
+			'presence configured'
+		)
+
 		// AI processing worker: drains wa.media_processing after media
 		// download completes. Routes to Gemini / ElevenLabs / LlamaParse.
 		this.processingWorker = new ProcessingWorker(
@@ -115,7 +144,8 @@ export class Bot {
 			this.apiServer = await buildServer({
 				getSock: () => this.sock ?? null,
 				store: this.store,
-				storage: this.mediaStorage
+				storage: this.mediaStorage,
+				typing: this.typing
 			})
 			const addr = await this.apiServer.listen({
 				host: config.api.host,
@@ -150,6 +180,14 @@ export class Bot {
 			this.detachWebhookEnqueuer?.()
 		} catch (err) {
 			log.warn({ err }, 'error detaching webhook enqueuer (ignored)')
+		}
+		// Close typing indicators while the socket is still alive, otherwise
+		// chats are left showing "typing…" until WhatsApp times it out.
+		try {
+			this.readReceipts.stop()
+			await this.typing.stopAll()
+		} catch (err) {
+			log.warn({ err }, 'error closing presence state (ignored)')
 		}
 		try {
 			await this.sock?.end(undefined)
@@ -207,6 +245,14 @@ export class Bot {
 		sock.ev.on('creds.update', saveCreds)
 		sock.ev.on('connection.update', update => void this.onConnectionUpdate(update))
 
+		// Read receipts for live traffic only. `append` batches and
+		// `messaging-history.set` carry backfill, and acking a backlog in one
+		// burst is both pointless and a spam signal.
+		sock.ev.on('messages.upsert', payload => {
+			if (payload.type !== 'notify') return
+			this.readReceipts.offer(payload.messages)
+		})
+
 		// Refresh in-memory group metadata cache (separate concern from the persistent store).
 		sock.ev.on('groups.update', async events => {
 			for (const e of events) {
@@ -240,10 +286,15 @@ export class Bot {
 			this.reconnectAttempt = 0
 			const me = this.sock?.user
 			log.info({ me: me?.id, lid: me?.lid, name: me?.name }, 'connection opened')
+			void this.readReceipts.checkPrivacy()
 			return
 		}
 
 		if (connection !== 'close') return
+
+		// The socket is gone, so every chatstate we pushed is void. Drop the
+		// sessions instead of refreshing into a dead connection.
+		this.typing.reset()
 
 		const boom = lastDisconnect?.error instanceof Boom ? lastDisconnect.error : undefined
 		const statusCode = boom?.output?.statusCode

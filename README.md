@@ -16,8 +16,12 @@ The bot does four things today:
    LlamaParse for documents), so every media row gets a searchable
    text/transcript/markdown projection.
 4. **Exposes** an HTTP API for AI agents and cron jobs to read chat history,
-   send / react / edit / delete messages, fetch media, and subscribe to
-   durable HMAC-signed webhooks. See [`docs/API.md`](docs/API.md).
+   send / react / edit / delete messages, fetch media, hold typing
+   indicators, and subscribe to durable HMAC-signed webhooks. See
+   [`docs/API.md`](docs/API.md).
+5. **Behaves like a client** on the presence layer: live inbound messages
+   are marked read automatically, and consumers can keep "typing…" up while
+   they compose a reply.
 
 The bot survives reconnects, app restarts, history-sync overlap, message
 edits, and deletions without losing data.
@@ -55,6 +59,8 @@ npm run render -- +359884430293
 | `src/auth.ts`                 | Postgres-backed Baileys auth state (replaces `useMultiFileAuthState`). |
 | `src/handlers/messages.ts`    | The hello-world responder (the only "feature" so far).          |
 | `src/store/`                  | The persistent message store (see `docs/INGESTION.md`).         |
+| `src/presence/`               | Read receipts + typing-indicator sessions (see `docs/API.md` §6.7). |
+| `src/api/`                    | Fastify HTTP API and webhook management routes.                 |
 | `src/db/`                     | Drizzle ORM schema, postgres-js client, IPv4 DNS guard.         |
 | `src/render/`                 | Conversation → Markdown renderer (see `docs/RENDERER.md`).      |
 | `src/recon/`                  | One-shot tool that dumps raw Baileys events to JSONL for study. |
@@ -122,13 +128,18 @@ npm run render -- +359884430293
   send/react/edit/delete, durable HMAC-signed webhooks backed by a third
   Postgres queue (`wa.webhook_deliveries`) with the same `FOR UPDATE SKIP
   LOCKED` worker pattern. See [`docs/API.md`](docs/API.md).
+- **Presence:** automatic read receipts for live inbound messages
+  (batched, jittered, backfill excluded) and API-driven typing indicators
+  that the bot refreshes ahead of WhatsApp's ~10s chatstate expiry, bounded
+  by a TTL so a crashed consumer can't leave a chat typing.
 
 **Not yet built (deliberately):**
 
 - LLM tool wrappers around the HTTP API (a separate layer, deferred).
 - Multi-tenant API keys / per-key scopes / rate limiting.
 - Inbound media proxy streaming optimisations (v1 buffers in memory).
-- Calls (`call.*`), presence updates, SSE/WebSocket push.
+- Calls (`call.*`), inbound presence events (other people typing / online),
+  SSE/WebSocket push.
 - Scheduled report delivery (cron jobs that pull from internal API and
   message a chat at a fixed time).
 - Telegram bridge for re-auth notifications when the WA session drops.
@@ -145,7 +156,15 @@ npm run render -- +359884430293
   PostgREST.
 - `DATABASE_URL` likewise grants full DB access. Keep it out of logs.
 - Baileys is unofficial; do not abuse it (no spam, no bulk messaging).
-  WhatsApp bans aggressively.
+  WhatsApp bans aggressively. The presence layer is deliberately
+  conservative for this reason: receipts are batched behind a randomised
+  delay and never applied to history backfill, typing refreshes are
+  jittered and capped, and Baileys 7 no longer sends delivery ACKs at all
+  (WhatsApp was banning for it).
+- Read receipts only produce blue ticks when the linked account has read
+  receipts enabled in WhatsApp's privacy settings; otherwise WhatsApp
+  downgrades them to `read-self`. The bot warns on connect when it sees
+  this.
 - The WA Web protocol version is intentionally pinned to whatever Baileys
   ships with. We do **not** call `fetchLatestBaileysVersion()` because per
   the v7 docs it can land you on an incompatible protocol version.

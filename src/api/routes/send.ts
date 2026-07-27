@@ -215,6 +215,8 @@ export const registerSendRoute = async (
 			if (!sent?.key?.id) {
 				throw app.httpErrors.internalServerError('sendMessage returned no key')
 			}
+			// The delivered message supersedes any "typing…" we were holding.
+			deps.typing.noteOutboundMessage(to)
 			const waId = sent.key.id
 			const seq = await waitForSeq(deps.store.accountId, to, waId, 8_000)
 
@@ -334,6 +336,7 @@ export const registerSendRoute = async (
 		const opts: MiscMessageGenerationOptions = quoted ? { quoted } : {}
 		const sent = await sock.sendMessage(to, content, opts)
 		if (!sent?.key?.id) throw app.httpErrors.internalServerError('sendMessage returned no key')
+		deps.typing.noteOutboundMessage(to)
 		const waId = sent.key.id
 		const seq = await waitForSeq(deps.store.accountId, to, waId, 8_000)
 

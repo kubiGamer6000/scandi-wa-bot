@@ -11,6 +11,7 @@ import { registerChatRoutes } from './routes/chats.js'
 import { registerMessageRoutes } from './routes/messages.js'
 import { registerSendRoute } from './routes/send.js'
 import { registerActionRoutes } from './routes/actions.js'
+import { registerPresenceRoutes } from './routes/presence.js'
 import { registerWebhookRoutes } from './routes/webhooks.js'
 import type { ApiDeps, TypedFastify } from './types.js'
 
@@ -55,6 +56,7 @@ export const buildServer = async (deps: ApiDeps): Promise<FastifyInstance> => {
 	await registerMessageRoutes(app, deps)
 	await registerSendRoute(app, deps)
 	await registerActionRoutes(app, deps)
+	await registerPresenceRoutes(app, deps)
 	await registerWebhookRoutes(app, deps)
 
 	// Catchall error handler. Fastify defaults are fine, but we want every

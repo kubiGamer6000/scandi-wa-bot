@@ -42,6 +42,10 @@ This is a Node.js service that:
   descriptions / transcriptions / parsed Markdown.
 - Exposes an HTTP API (this document) plus durable outbound webhooks so
   external systems can read, react, and send.
+- Behaves like a real WhatsApp client on the presence layer: inbound
+  messages are marked read automatically, and consumers can hold a
+  "typing…" indicator open while they compose a reply
+  ([§6.7](#67-presence--typing-indicators)).
 
 The bot is **single-account** by design today: one WhatsApp number per
 deployment. The API is also single-tenant — one bearer token for the whole
@@ -1028,6 +1032,88 @@ Already covered in [§5](#5-webhooks--the-primary-integration-path). Reference:
 - `DELETE /v1/webhooks/:id`
 - `POST   /v1/webhooks/:id/test`
 
+### 6.7 Presence & typing indicators
+
+#### Read receipts are automatic
+
+You don't call anything to mark messages read. The bot acknowledges every
+**live** inbound message in DMs and groups on its own, a short randomised
+moment after it arrives, batched per chat. Backfill (history sync) is never
+acknowledged — receipting a multi-year backlog in one burst is both
+pointless and a spam signal.
+
+Two things to know:
+
+- WhatsApp downgrades the ack to `read-self` (read on our side, **no blue
+  ticks for the sender**) when the linked account has read receipts turned
+  off. The bot logs a warning on connect when it detects this; fix it under
+  WhatsApp → Settings → Privacy → Read receipts on the paired phone.
+- Turn the whole thing off with `READ_RECEIPTS_ENABLED=false`, or restrict
+  it to specific chats with `READ_RECEIPTS_JIDS=<jid>,<jid>`.
+
+#### `POST /v1/chats/:jid/typing`
+
+Opens (or extends) a typing session. The bot re-sends the WhatsApp
+chatstate every `TYPING_REFRESH_MS` (default 7.5s, jittered) for as long as
+the session lives, because WhatsApp expires an indicator after ~10s.
+
+```bash
+# start typing
+curl -X POST "http://127.0.0.1:8787/v1/chats/120363012345678901%40g.us/typing" \
+  -H "Authorization: Bearer $TOKEN"
+
+# or ask for a specific state / lifetime
+curl -X POST "http://127.0.0.1:8787/v1/chats/120363012345678901%40g.us/typing" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"state":"recording","ttl_ms":90000}'
+```
+
+```json
+{
+  "jid": "120363012345678901@g.us",
+  "state": "composing",
+  "expires_at": "2026-05-11T18:45:58.000Z",
+  "refresh_ms": 7500
+}
+```
+
+| Field    | Default       | Meaning                                                          |
+| -------- | ------------- | ---------------------------------------------------------------- |
+| `state`  | `composing`   | `composing` = typing, `recording` = recording a voice note.      |
+| `ttl_ms` | `TYPING_TTL_MS` (120000) | How long the bot keeps refreshing without hearing from you again. Capped at `TYPING_MAX_TTL_MS`. |
+
+A session ends when **any** of these happens:
+
+1. you `DELETE` it,
+2. **the bot sends a message to that chat** — the message supersedes the
+   indicator, so the happy path needs no explicit stop,
+3. `ttl_ms` lapses (a crashed consumer can't leave a chat typing forever),
+4. `TYPING_MAX_SESSION_MS` (default 15 min) is reached,
+5. the socket drops.
+
+For a long job, call this endpoint again well inside `ttl_ms` to hold the
+indicator; repeat calls for the same chat extend the existing session
+rather than stacking. At most `TYPING_MAX_CONCURRENT_CHATS` (default 10)
+chats can be typing at once — an account typing in twenty conversations
+simultaneously is not a pattern a human produces.
+
+#### `DELETE /v1/chats/:jid/typing`
+
+Sends `paused` and closes the session. Returns `204`, and is idempotent —
+safe to call unconditionally in a `finally` block. Send no body (a
+`Content-Type: application/json` header with an empty body makes Fastify
+reject the request).
+
+#### `PUT /v1/presence`
+
+Global online/offline. Body: `{"state":"available"}` or
+`{"state":"unavailable"}`. Returns `204`.
+
+Note that `available` suppresses WhatsApp push notifications on the paired
+phone for as long as it's held — that's WhatsApp's behaviour for an active
+desktop client, and the reason `MARK_ONLINE_ON_CONNECT` defaults to false.
+Typing indicators do **not** require going online.
+
 ---
 
 ## 7. The message payload
@@ -1362,23 +1448,41 @@ app.post('/wa-webhook', async (req, res) => {
     return `${who}: ${body}`
   }).join('\n')
 
-  const reply = await callYourLLM(conversation, m.text ?? '')
+  // Show "typing…" while the model works. The bot refreshes the chatstate
+  // itself and drops it when the reply below is sent; re-assert every ~40s
+  // if your model can take longer than ttl_ms.
+  const typing = (method: string) =>
+    fetch(`${BOT}/v1/chats/${encodeURIComponent(m.chat.jid)}/typing`, {
+      method,
+      headers: { authorization: `Bearer ${TOKEN}` }
+    }).catch(() => undefined)
 
-  await fetch(`${BOT}/v1/send`, {
-    method: 'POST',
-    headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
-    body: JSON.stringify({
-      to: m.chat.jid,
-      text: reply,
-      quote_seq: m.seq        // reply-quote the user's message
+  await typing('POST')
+  try {
+    const reply = await callYourLLM(conversation, m.text ?? '')
+
+    await fetch(`${BOT}/v1/send`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        to: m.chat.jid,
+        text: reply,
+        quote_seq: m.seq        // reply-quote the user's message
+      })
     })
-  })
+  } finally {
+    // No-op if the send already closed the session.
+    await typing('DELETE')
+  }
 
   res.sendStatus(200)
 })
 
 app.listen(3000)
 ```
+
+Read receipts need no code here: the bot already marked the incoming
+message read before your webhook fired.
 
 ### 11.2 Daily report via cron
 
@@ -1492,6 +1596,12 @@ async function handle(event) {
   spam heuristics.
 - **No HTTP rate limiting is enforced today.** Be a good neighbor —
   burst sensibly and back off on 503s.
+- **Presence traffic is shaped by the bot, not by you.** Read receipts are
+  batched per chat behind a randomised delay, and a typing session costs
+  one chatstate node every ~7.5s no matter how often you re-assert it. Both
+  are cheap, but they are WhatsApp protocol traffic: don't try to drive the
+  indicator yourself on a tighter loop, and leave the defaults alone unless
+  you have a reason.
 - **Webhook delivery concurrency** is configurable via
   `WEBHOOK_CONCURRENCY` (default 4). The bot will not send more than N
   webhook POSTs in flight to **all** of your endpoints combined.
@@ -1546,8 +1656,10 @@ All `*_at` and `timestamp` fields are ISO 8601 with explicit UTC offset
 - **Rate limiting.** Will become important when the bot is exposed
   beyond a trusted local consumer.
 - **Server-Sent Events / WebSocket push.** Webhooks cover this.
-- **Call (`call.*`) and presence (`presence.update`) events.** Not
-  currently surfaced as webhooks.
+- **Inbound presence.** The bot sends its own presence
+  ([§6.7](#67-presence--typing-indicators)) but doesn't surface other
+  people's `presence.update` events (typing / online) as webhooks.
+- **Call (`call.*`) events.** Not currently surfaced as webhooks.
 - **Channel / newsletter sends.** Receive-only for now.
 
 ---
@@ -1575,7 +1687,7 @@ All `*_at` and `timestamp` fields are ISO 8601 with explicit UTC offset
 
 ## Appendix A: Minimal smoke check script
 
-See `scripts/api-smoke.ts` in the bot repo for a 15-step integration test
+See `scripts/api-smoke.ts` in the bot repo for a 16-step integration test
 that exercises every endpoint. Useful as both a deployment check and as
 worked examples in TypeScript.
 

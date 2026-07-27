@@ -53,6 +53,55 @@ export interface AppConfig {
 	readonly processing: ProcessingConfig
 	readonly api: ApiConfig
 	readonly webhooks: WebhookConfig
+	readonly readReceipts: ReadReceiptConfig
+	readonly typing: TypingConfig
+}
+
+export interface ReadReceiptConfig {
+	/** Master switch. When off, no read receipts are ever sent. */
+	readonly enabled: boolean
+	/**
+	 * Chats we send receipts for. `['*']` (default) means every DM and group.
+	 * Anything else is an exact JID allow-list.
+	 */
+	readonly jids: readonly string[]
+	/**
+	 * Randomised think-time before a batch of receipts goes out. Receipts that
+	 * land the same millisecond a message arrives read like a machine, so we
+	 * wait a human-ish moment first.
+	 */
+	readonly delayMinMs: number
+	readonly delayMaxMs: number
+	/** Max keys per `readMessages()` call. Larger batches are split. */
+	readonly batchSize: number
+	/** Floor on the gap between two consecutive receipt flushes. */
+	readonly minIntervalMs: number
+}
+
+export interface TypingConfig {
+	/** Master switch for the `composing`/`recording` chatstate endpoints. */
+	readonly enabled: boolean
+	/**
+	 * How often we re-send the chatstate. WhatsApp expires a typing indicator
+	 * after ~10s, so this must stay under that; jitter is applied on top.
+	 */
+	readonly refreshMs: number
+	/** Jitter (±) applied to every refresh so the cadence isn't metronomic. */
+	readonly refreshJitterMs: number
+	/** Session lifetime when the caller doesn't pass an explicit `ttl_ms`. */
+	readonly defaultTtlMs: number
+	/** Upper bound a caller may request for a single session. */
+	readonly maxTtlMs: number
+	/** Hard ceiling on one session's total lifetime, refreshes included. */
+	readonly maxSessionMs: number
+	/** Cap on chats typing at once — a bot typing everywhere looks automated. */
+	readonly maxConcurrentChats: number
+	/**
+	 * Whether to flip global presence to `available` while typing. Off by
+	 * default: going online suppresses push notifications on the paired phone
+	 * (the same reason `MARK_ONLINE_ON_CONNECT` defaults to false).
+	 */
+	readonly markAvailable: boolean
 }
 
 export interface ApiConfig {
@@ -224,6 +273,42 @@ const buildWebhookConfig = (): WebhookConfig => ({
 	timeoutMs: Math.max(1000, parseIntEnv(process.env.WEBHOOK_TIMEOUT_MS, 10_000))
 })
 
+const buildReadReceiptConfig = (): ReadReceiptConfig => {
+	const jids = parseList(process.env.READ_RECEIPTS_JIDS)
+	const delayMinMs = Math.max(0, parseIntEnv(process.env.READ_RECEIPTS_DELAY_MIN_MS, 600))
+	const delayMaxMs = Math.max(delayMinMs, parseIntEnv(process.env.READ_RECEIPTS_DELAY_MAX_MS, 2_500))
+	return {
+		enabled: parseBool(process.env.READ_RECEIPTS_ENABLED, true),
+		jids: jids.length > 0 ? jids : ['*'],
+		delayMinMs,
+		delayMaxMs,
+		batchSize: Math.max(1, parseIntEnv(process.env.READ_RECEIPTS_BATCH_SIZE, 25)),
+		minIntervalMs: Math.max(0, parseIntEnv(process.env.READ_RECEIPTS_MIN_INTERVAL_MS, 750))
+	}
+}
+
+const buildTypingConfig = (): TypingConfig => {
+	// Keep the refresh floor under WhatsApp's ~10s chatstate expiry even after
+	// the worst-case negative jitter, otherwise the indicator flickers.
+	const refreshMs = Math.min(9_000, Math.max(3_000, parseIntEnv(process.env.TYPING_REFRESH_MS, 7_500)))
+	const refreshJitterMs = Math.max(
+		0,
+		Math.min(refreshMs - 2_000, parseIntEnv(process.env.TYPING_REFRESH_JITTER_MS, 1_200))
+	)
+	const maxTtlMs = Math.max(10_000, parseIntEnv(process.env.TYPING_MAX_TTL_MS, 300_000))
+	const defaultTtlMs = Math.min(maxTtlMs, Math.max(5_000, parseIntEnv(process.env.TYPING_TTL_MS, 120_000)))
+	return {
+		enabled: parseBool(process.env.TYPING_ENABLED, true),
+		refreshMs,
+		refreshJitterMs,
+		defaultTtlMs,
+		maxTtlMs,
+		maxSessionMs: Math.max(maxTtlMs, parseIntEnv(process.env.TYPING_MAX_SESSION_MS, 900_000)),
+		maxConcurrentChats: Math.max(1, parseIntEnv(process.env.TYPING_MAX_CONCURRENT_CHATS, 10)),
+		markAvailable: parseBool(process.env.TYPING_MARK_AVAILABLE, false)
+	}
+}
+
 const browserPlatformRaw = (process.env.BROWSER_PLATFORM ?? 'Ubuntu').trim()
 const browserPlatform: AppConfig['browser']['platform'] =
 	browserPlatformRaw === 'macOS' || browserPlatformRaw === 'Windows' ? browserPlatformRaw : 'Ubuntu'
@@ -246,5 +331,7 @@ export const config: AppConfig = {
 	media: buildMediaConfig(),
 	processing: buildProcessingConfig(),
 	api: buildApiConfig(),
-	webhooks: buildWebhookConfig()
+	webhooks: buildWebhookConfig(),
+	readReceipts: buildReadReceiptConfig(),
+	typing: buildTypingConfig()
 }

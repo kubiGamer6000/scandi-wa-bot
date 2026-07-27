@@ -1,7 +1,7 @@
 /**
  * scripts/api-smoke.ts
  *
- * 15-step integration test that exercises every HTTP API endpoint against
+ * 16-step integration test that exercises every HTTP API endpoint against
  * the live bot. Run with the bot already up via `npm run dev` (so it's
  * fully connected to WhatsApp). Each step prints PASS / FAIL with the
  * actual vs expected so the run is auditable.
@@ -449,7 +449,38 @@ const main = async (): Promise<void> => {
 			assert((dl.headers.get('location') ?? '').startsWith('https://'), 'no https location')
 		})
 
-		await printStep('15. DELETE webhook + no more deliveries', async () => {
+		await printStep('15. Typing session lifecycle', async () => {
+			const typingPath = `/v1/chats/${encodeURIComponent(TO_JID)}/typing`
+
+			const open = await api<{ state: string; expires_at: string; refresh_ms: number }>(
+				'POST',
+				typingPath
+			)
+			assert(open.status === 200, `open status ${open.status}`)
+			assert(open.body.state === 'composing', `state ${open.body.state}`)
+			assert(
+				new Date(open.body.expires_at).getTime() > Date.now(),
+				`expires_at in the past: ${open.body.expires_at}`
+			)
+			console.log(
+				c.y(`\n     → "typing…" should be visible on ${PHONE} now (refresh ${open.body.refresh_ms}ms).`)
+			)
+
+			// Sending to the chat is expected to close the session on its own.
+			await sleep(3_000)
+			await api('POST', '/v1/send', { to: TO_JID, text: '[smoke] step 15 — after typing' })
+
+			// Idempotent close: 204 whether or not a session is still open.
+			const close = await api('DELETE', typingPath)
+			assert(close.status === 204, `close status ${close.status}`)
+			const closeAgain = await api('DELETE', typingPath)
+			assert(closeAgain.status === 204, `second close status ${closeAgain.status}`)
+
+			const presence = await api('PUT', '/v1/presence', { state: 'unavailable' })
+			assert(presence.status === 204, `presence status ${presence.status}`)
+		})
+
+		await printStep('16. DELETE webhook + no more deliveries', async () => {
 			if (!subscriptionId) throw new Error('no subscriptionId')
 			const del = await api('DELETE', `/v1/webhooks/${subscriptionId}`)
 			assert(del.status === 204, `delete status ${del.status}`)
@@ -459,7 +490,7 @@ const main = async (): Promise<void> => {
 			// is filtered) AND if it did, the sub is gone anyway.
 			await api('POST', '/v1/send', {
 				to: TO_JID,
-				text: '[smoke] step 15 — should not produce webhook'
+				text: '[smoke] step 16 — should not produce webhook'
 			})
 			await sleep(2_500)
 			const after = receiver.captured.length

@@ -21,6 +21,14 @@ A single Node.js process owns:
 - One **`MessageBus`** (`src/store/bus.ts`) — typed pub/sub for message
   lifecycle events (`received`, `edited`, `deleted`, `reacted`,
   `processed`). The webhook layer is the only consumer today.
+- One **`ReadReceiptWorker`** (`src/presence/read-receipts.ts`) that acks
+  live inbound messages (`sock.readMessages`) after a jittered delay, in
+  batches, with an LRU of already-acked keys. History-sync backfill is
+  deliberately never acked.
+- One **`TypingManager`** (`src/presence/typing.ts`) that owns "typing…"
+  sessions: API consumers open one while they compose a reply and the
+  manager re-pushes the chatstate before WhatsApp's ~10s expiry, until the
+  session is closed, superseded by an outbound message, or expired.
 - One **Fastify HTTP API** (`src/api/server.ts`) listening on `127.0.0.1`
   by default — exposes chat / message reads, send / react / edit / delete,
   webhook CRUD, and media fetch. Bearer-auth via `API_AUTH_TOKEN`.
@@ -98,7 +106,9 @@ A single Node.js process owns:
 | **AI processors**      | `src/store/processing/processors/` | `gemini.ts` (video+image via GCS URI), `elevenlabs.ts` (audio transcription), `llamaparse.ts` (document→markdown). |
 | **Prompts**            | `src/store/processing/prompts.ts`  | Default video/image prompts with env-var override support.                                           |
 | **Message bus**        | `src/store/bus.ts`                 | Typed in-process EventEmitter fired by handlers after DB writes; consumed by the webhook enqueuer.   |
-| **HTTP API**           | `src/api/`                         | Fastify factory + bearer-auth + route modules (`health`, `chats`, `messages`, `send`, `actions`, `webhooks`). |
+| **Read receipts**      | `src/presence/read-receipts.ts`    | Batches + jitters `readMessages()` for live inbound traffic; skips backfill, reactions, protocol messages, status/newsletters. |
+| **Typing indicators**  | `src/presence/typing.ts`           | Per-chat chatstate sessions with jittered refresh, TTL, hard cap, and concurrency cap. Closed by `DELETE`, by an outbound send, or on socket loss. |
+| **HTTP API**           | `src/api/`                         | Fastify factory + bearer-auth + route modules (`health`, `chats`, `messages`, `send`, `actions`, `presence`, `webhooks`). |
 | **API payloads**       | `src/api/payloads.ts`              | `buildMessagePayload()` — single rich JSON shape shared by webhook deliveries and GET endpoints.     |
 | **Webhook enqueuer**   | `src/webhooks/enqueue.ts`          | `MessageBus` listener that fans events to matching active subscriptions; inserts `wa.webhook_deliveries` rows. |
 | **Webhook worker**     | `src/webhooks/worker.ts`           | Drains deliveries via FOR UPDATE SKIP LOCKED; HMAC-SHA256 signs and POSTs; exponential-backoff retries. |

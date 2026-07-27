@@ -5,6 +5,7 @@ import type { RawReplyDefaultExpression, RawRequestDefaultExpression, RawServerD
 
 import type { ChatStore } from '../store/index.js'
 import type { MediaStorage } from '../store/media/storage.js'
+import type { TypingManager } from '../presence/index.js'
 
 /** Returns the current Baileys socket, or null if not yet connected. */
 export type GetSock = () => WASocket | null
@@ -14,6 +15,7 @@ export interface ApiDeps {
 	getSock: GetSock
 	store: ChatStore
 	storage: MediaStorage
+	typing: TypingManager
 }
 
 /**

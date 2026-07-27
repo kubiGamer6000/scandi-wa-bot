@@ -47,6 +47,19 @@ watch `wa.sync_state.history_progress_pct` climb to 100 and then
 | `SYNC_FULL_HISTORY`       | `true`             | Ask WhatsApp for the full history after pair.                                      |
 | `MARK_ONLINE_ON_CONNECT`  | `false`            | When `false`, your phone keeps getting WA push notifications.                      |
 | `ALLOWED_JIDS`            | _(empty)_          | Comma-separated allow-list for outbound messages (handy while testing).            |
+| `READ_RECEIPTS_ENABLED`   | `true`             | Ack live inbound messages in DMs and groups. Backfill is never acked.               |
+| `READ_RECEIPTS_JIDS`      | `*`                | Restrict receipts to specific chats. `*` = all DMs and groups.                      |
+| `READ_RECEIPTS_DELAY_MIN_MS` / `_MAX_MS` | `600` / `2500` | Randomised think-time before a batch of receipts goes out.            |
+| `READ_RECEIPTS_BATCH_SIZE`| `25`               | Keys per `readMessages()` call.                                                     |
+| `READ_RECEIPTS_MIN_INTERVAL_MS` | `750`        | Floor between two receipt flushes.                                                  |
+| `TYPING_ENABLED`          | `true`             | Enables `POST/DELETE /v1/chats/:jid/typing`. See `docs/API.md` §6.7.                |
+| `TYPING_REFRESH_MS`       | `7500`             | Chatstate refresh cadence. Clamped to 3000-9000 (WA expires typing after ~10s).     |
+| `TYPING_REFRESH_JITTER_MS`| `1200`             | ± jitter on the cadence so it isn't metronomic.                                     |
+| `TYPING_TTL_MS`           | `120000`           | Default session lifetime when a caller doesn't pass `ttl_ms`.                       |
+| `TYPING_MAX_TTL_MS`       | `300000`           | Largest `ttl_ms` a caller may request.                                              |
+| `TYPING_MAX_SESSION_MS`   | `900000`           | Hard cap on one session however often it's re-asserted.                             |
+| `TYPING_MAX_CONCURRENT_CHATS` | `10`           | Chats allowed to show "typing…" simultaneously.                                     |
+| `TYPING_MARK_AVAILABLE`   | `false`            | Go online while typing. Leaving this off keeps phone push notifications working.     |
 | `FIREBASE_STORAGE_BUCKET` | _(empty)_          | When set, the media downloader is enabled. See "Media storage setup" below.        |
 | `FIREBASE_SERVICE_ACCOUNT_PATH` | _(empty)_    | Path to a service-account JSON. Alternative: `FIREBASE_SERVICE_ACCOUNT_JSON` (inline) or `GOOGLE_APPLICATION_CREDENTIALS` (ADC). |
 | `MEDIA_DOWNLOAD_ENABLED`  | auto               | Master switch. Defaults to ON when `FIREBASE_STORAGE_BUCKET` is set.               |
@@ -323,6 +336,38 @@ This is normal — WA sends the full multi-year history in chunks over
 several minutes. Watch `wa.sync_state.history_progress_pct` and
 `history_chunk_order` to confirm progress. If it really hangs, check
 that your phone has a stable internet connection.
+
+### Senders don't see blue ticks
+The bot acks live inbound messages, but WhatsApp silently downgrades the ack
+to `read-self` when the linked account has read receipts switched off — the
+message is read on our side and the sender sees nothing. On connect the bot
+logs either `read receipts enabled` or a warning naming the current setting:
+
+```bash
+journalctl -u scandi-wa-bot | grep -i 'read receipts'
+```
+
+Fix it on the paired phone: Settings → Privacy → Read receipts. Note that
+WhatsApp never sends read receipts for group *status* updates or channels,
+and the bot deliberately skips reactions and protocol messages.
+
+Nothing at all in the log? Check `READ_RECEIPTS_ENABLED` and, if set,
+whether the chat is in `READ_RECEIPTS_JIDS`. Receipts for messages that
+arrive while the socket is down are dropped rather than replayed late.
+
+### A chat is stuck showing "typing…"
+Typing sessions are TTL-bounded, so this self-heals within
+`TYPING_TTL_MS` (default 2 min) even if the consumer dies mid-run. To clear
+it immediately:
+
+```bash
+curl -X DELETE "http://127.0.0.1:8787/v1/chats/<jid-urlencoded>/typing" \
+  -H "Authorization: Bearer $API_AUTH_TOKEN"
+```
+
+If a consumer regularly leaves indicators dangling, look for a missing
+`finally` on its side — the bot also clears the session automatically when
+it sends a message to that chat.
 
 ### Reactions / deletions not appearing in render
 The render filters reactionMessage and REVOKE protocol envelopes. The
