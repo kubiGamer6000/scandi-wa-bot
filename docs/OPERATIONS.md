@@ -324,6 +324,24 @@ If only IPv6 returns, your DNS resolver is misconfigured. Add a
 public-IPv4-only DNS resolver (1.1.1.1) or set `dns: 'ipv4first'` at the
 OS level.
 
+### `Connection Failure` / statusCode `405` reconnect loop
+WhatsApp rejected the client revision as too old (`client_too_old`).
+Baileys' bundled default goes stale; the bot fetches the live revision
+from `web.whatsapp.com/sw.js` on every connect and passes it to
+`makeWASocket({ version })`.
+
+Confirm the connect line shows a current tertiary (today ≈ `1044…`):
+
+```bash
+journalctl -u scandi-wa-bot | grep 'connecting to WhatsApp'
+```
+
+If `waVersionLive: false`, the droplet can't reach `web.whatsapp.com`
+and fell back to the stale pin — fix outbound HTTPS / DNS, then restart.
+Do **not** wipe `wa.auth_*` for a 405; re-pairing won't help until the
+version is current. Stop hammering reconnects (`bot stop`) while you
+deploy/fix.
+
 ### `loggedOut` immediately after pair
 Common causes:
 - The phone hosting WhatsApp has been offline for too long. WA expires

@@ -3,6 +3,7 @@ import makeWASocket, {
 	Browsers,
 	type ConnectionState,
 	DisconnectReason,
+	fetchLatestWaWebVersion,
 	type GroupMetadata,
 	type WASocket
 } from 'baileys'
@@ -215,20 +216,32 @@ export class Bot {
 		if (!this.store || !this.auth) throw new Error('Bot.connect called before start()')
 		const { state, saveCreds } = this.auth
 
+		// Prefer the live WA Web revision from web.whatsapp.com/sw.js.
+		// Baileys' bundled default (and fetchLatestBaileysVersion, which scrapes
+		// GitHub) go stale; WhatsApp then rejects login with Connection Failure
+		// 405 (client_too_old). ProtoCocktail still prefers pinning eventually,
+		// but until Baileys ships current defaults this is required for connect.
+		const waVersion = await fetchLatestWaWebVersion()
+		if (!waVersion.isLatest) {
+			log.warn(
+				{ version: waVersion.version, err: waVersion.error },
+				'could not fetch live WA Web version; falling back to Baileys default (405 risk)'
+			)
+		}
+
 		log.info(
 			{
 				syncFullHistory: config.syncFullHistory,
-				browser: `${config.browser.platform}/${config.browser.name}`
+				browser: `${config.browser.platform}/${config.browser.name}`,
+				waVersion: waVersion.version,
+				waVersionLive: waVersion.isLatest
 			},
 			'connecting to WhatsApp'
 		)
 
-		// We intentionally do NOT call fetchLatestBaileysVersion(): per the
-		// Baileys 7.x docs the WA Web version is pinned to the library version
-		// (ProtoCocktail), and dynamically fetching the latest version risks
-		// protocol incompatibility.
 		const sock = makeWASocket({
 			auth: state,
+			version: waVersion.version,
 			logger,
 			browser: pickBrowser(),
 			markOnlineOnConnect: config.markOnlineOnConnect,
@@ -315,7 +328,18 @@ export class Bot {
 			process.exit(1)
 		}
 
-		const delay = RECONNECT_DELAYS_MS[Math.min(this.reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)]
+		// 405 = WhatsApp `client_too_old`. Rapid retries with a stale version
+		// just burn reconnect budget and look automated; back off harder.
+		if (statusCode === 405) {
+			log.warn(
+				'WhatsApp rejected the client version (405 client_too_old). ' +
+					'Next connect will re-fetch web.whatsapp.com/sw.js.'
+			)
+		}
+
+		const idx = Math.min(this.reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)
+		const baseDelay = RECONNECT_DELAYS_MS[idx] ?? 30_000
+		const delay = statusCode === 405 ? Math.max(baseDelay, 30_000) : baseDelay
 		this.reconnectAttempt += 1
 		log.info({ attempt: this.reconnectAttempt, delayMs: delay }, 'reconnecting')
 
