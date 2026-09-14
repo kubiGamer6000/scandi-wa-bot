@@ -53,6 +53,12 @@ export interface QuotedRef {
 	message_id: string
 	from_jid: string | null
 	text: string | null
+	/**
+	 * True when the quoted message was sent by this bot. Populated when the
+	 * quoted row is in our DB; null when we only have the envelope fields.
+	 * Consumers use this (with `from_jid`) to treat swipe-replies as addressing.
+	 */
+	from_me: boolean | null
 }
 
 export interface MediaPayload {
@@ -239,11 +245,15 @@ export const buildMessagePayload = async (
 		participantCount = countRows[0]?.n ?? null
 	}
 
-	// Resolve quoted.seq if we recognise the quoted msg id.
+	// Resolve quoted.seq / from_me if we recognise the quoted msg id.
 	let quoted: QuotedRef | null = null
 	if (msgRow.quotedMsgId) {
 		const [q] = await db
-			.select({ seq: messages.seq })
+			.select({
+				seq: messages.seq,
+				fromMe: messages.fromMe,
+				participant: messages.participant
+			})
 			.from(messages)
 			.where(
 				and(
@@ -256,8 +266,11 @@ export const buildMessagePayload = async (
 		quoted = {
 			seq: q?.seq ?? null,
 			message_id: msgRow.quotedMsgId,
-			from_jid: msgRow.quotedParticipant,
-			text: msgRow.quotedText
+			// Prefer the envelope's participant (what WA sent on the reply);
+			// fall back to the stored row when the envelope omitted it.
+			from_jid: msgRow.quotedParticipant ?? q?.participant ?? null,
+			text: msgRow.quotedText,
+			from_me: q?.fromMe ?? null
 		}
 	}
 

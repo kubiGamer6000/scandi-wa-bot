@@ -161,7 +161,8 @@ You'll mostly see `extendedTextMessage`, `imageMessage`, `audioMessage`,
 - **Mentions**. A message in a group can tag specific users. The payload
   carries `mentioned_jids: string[]`. Additionally, the bot computes
   `mentioned_self: boolean` — true if the bot itself was @-mentioned.
-  **Use `mentioned_self` to gate AI replies in groups.**
+  **Use `mentioned_self` (or `quoted.from_me` / `quoted.from_jid` for
+  swipe-replies to the bot) to gate AI replies in groups.**
 
 ### 2.6 The bot's own messages
 
@@ -1161,7 +1162,8 @@ This is the canonical shape used by:
     "seq": 42170,
     "message_id": "ABCDE...",
     "from_jid": "359884430293@s.whatsapp.net",
-    "text": "Check out the new view"
+    "text": "Check out the new view",
+    "from_me": false
   },
   "media": {
     "media_type": "image",
@@ -1207,7 +1209,7 @@ This is the canonical shape used by:
 | `type`                      | string \| null      | Protocol type. See [§2.4](#24-message-types).                                           |
 | `text`                      | string \| null      | The text content for text messages; caption denormalized for media messages.            |
 | `caption`                   | string \| null      | The original caption field (might differ from `text` in obscure cases).                 |
-| `mentioned_self`            | bool                | **Use this to gate AI replies in groups.** True if the bot's `pn_jid` or `lid_jid` appears in any `contextInfo.mentionedJid` in the raw proto. |
+| `mentioned_self`            | bool                | True if the bot's `pn_jid` or `lid_jid` appears in any `contextInfo.mentionedJid`. Gate group AI replies with this **or** a reply to the bot (`quoted.from_me` / matching `quoted.from_jid`). |
 | `mentioned_jids`            | string[]            | Every JID mentioned anywhere in the message (deep-scanned).                             |
 | `addressing_mode`           | `"pn"` \| `"lid"` \| null | Which form WhatsApp used to address.                                              |
 | `forwarded`                 | bool \| null        | True if WA marked this as forwarded.                                                    |
@@ -1221,6 +1223,8 @@ This is the canonical shape used by:
 | `tombstone`                 | bool                | True for delete-for-everyone messages. Excluded from history by default.                |
 | `quoted`                    | object \| null      | If this message was a reply.                                                            |
 | `quoted.seq`                | int \| null         | `null` if the quoted message isn't in our DB yet (e.g. quoted across a sync boundary). Use `quoted.message_id` (`wa_id`) for direct lookup. |
+| `quoted.from_jid`           | string \| null      | Author of the quoted message (PN or LID).                                               |
+| `quoted.from_me`            | bool \| null        | True if the quoted message was sent by this bot (when the row is in our DB). Use with `from_jid` to treat swipe-replies as addressing. |
 | `quoted.text`               | string \| null      | Denormalized snippet — saves a round trip in many cases.                                |
 | `media`                     | object \| null      | See [§8](#8-media-storage-processing-and-fetching).                                     |
 | `reactions[]`               | array               | Most recent state per actor. `emoji` may be `null` if reaction removed.                 |
@@ -1430,8 +1434,11 @@ app.post('/wa-webhook', async (req, res) => {
   if (event.event !== 'message.received') return res.sendStatus(200)
 
   const m = event.message
-  // Only reply in groups when @-mentioned, or in DMs.
-  if (m.chat.type === 'group' && !m.mentioned_self) return res.sendStatus(200)
+  // Groups: only when @-mentioned or swipe-replying to one of our messages.
+  const addressed =
+    m.mentioned_self ||
+    m.quoted?.from_me === true
+  if (m.chat.type === 'group' && !addressed) return res.sendStatus(200)
 
   // Build context: last 20 messages in the chat
   const history = await fetch(
