@@ -1,7 +1,6 @@
 import { hostname } from 'node:os'
 import { setTimeout as sleep } from 'node:timers/promises'
 
-import pLimit from 'p-limit'
 import { sql } from 'drizzle-orm'
 
 import { childLogger } from '../../logger.js'
@@ -9,6 +8,7 @@ import type { ProcessingConfig } from '../../config.js'
 import { db } from '../../db/index.js'
 import type { StoreContext } from '../types.js'
 import type { MediaStorage } from '../media/storage.js'
+import { processingEnqueued } from './enqueue.js'
 import { PROCESSOR_REGISTRY } from './processors/registry.js'
 import type { ProcessorInput, ProcessorContext } from './processors/types.js'
 
@@ -37,9 +37,11 @@ const backoffSeconds = (attempt: number): number =>
 
 export class ProcessingWorker {
 	private readonly workerId = `${hostname()}-${process.pid}-proc`
-	private readonly limiter: ReturnType<typeof pLimit>
 	private running = false
 	private wakeResolve: (() => void) | null = null
+	/** A notify() that arrived while the loop wasn't sleeping; consumed by the next sleep. */
+	private wakePending = false
+	private readonly inFlight = new Set<Promise<void>>()
 	private loopPromise: Promise<void> | null = null
 	private stopping = false
 
@@ -48,7 +50,6 @@ export class ProcessingWorker {
 		private readonly storage: MediaStorage,
 		private readonly cfg: ProcessingConfig
 	) {
-		this.limiter = pLimit(cfg.concurrency)
 	}
 
 	start(): void {
@@ -59,6 +60,7 @@ export class ProcessingWorker {
 		}
 		this.running = true
 		this.stopping = false
+		processingEnqueued.on('enqueued', this.onEnqueued)
 		this.loopPromise = this.loop().catch(err => {
 			log.error({ err }, 'processing worker loop crashed')
 		})
@@ -75,10 +77,14 @@ export class ProcessingWorker {
 		)
 	}
 
+	private readonly onEnqueued = (): void => this.notify()
+
 	notify(): void {
 		if (this.wakeResolve) {
 			this.wakeResolve()
 			this.wakeResolve = null
+		} else {
+			this.wakePending = true
 		}
 	}
 
@@ -86,9 +92,13 @@ export class ProcessingWorker {
 		if (!this.running) return
 		this.stopping = true
 		this.running = false
+		processingEnqueued.off('enqueued', this.onEnqueued)
 		this.notify()
 		try {
 			await this.loopPromise
+			// Let in-flight jobs finish, but never hold shutdown hostage: an
+			// unfinished job's lease expires and it is retried after restart.
+			await Promise.race([Promise.allSettled([...this.inFlight]), sleep(20_000)])
 		} finally {
 			this.loopPromise = null
 		}
@@ -96,12 +106,26 @@ export class ProcessingWorker {
 	}
 
 	private async loop(): Promise<void> {
+		let lastReapAt = 0
 		while (this.running) {
-			await this.reapExpiredLeases().catch(err =>
-				log.warn({ err }, 'processing lease reaper failed')
-			)
+			// Claim only as many rows as there are free slots, and start each job
+			// as soon as a slot frees up. (Previously a whole batch was awaited,
+			// so one slow video or image held every voice note behind it.)
+			const free = this.cfg.concurrency - this.inFlight.size
+			if (free <= 0) {
+				await this.sleepUntilWake(this.cfg.pollIntervalMs)
+				continue
+			}
 
-			const claimed = await this.claimBatch().catch(err => {
+			if (Date.now() - lastReapAt > 30_000) {
+				lastReapAt = Date.now()
+				// Reap expired leases so crashed workers' rows come back.
+				await this.reapExpiredLeases().catch(err =>
+					log.warn({ err }, 'processing lease reaper failed')
+				)
+			}
+
+			const claimed = await this.claimBatch(Math.min(free, this.cfg.batchSize)).catch(err => {
 				log.error({ err }, 'processing claim batch failed')
 				return [] as ClaimRow[]
 			})
@@ -112,18 +136,20 @@ export class ProcessingWorker {
 				continue
 			}
 
-			log.debug({ n: claimed.length }, 'claimed processing batch')
-			await Promise.all(
-				claimed.map(row =>
-					this.limiter(() => this.processRow(row).catch(err =>
-						log.error({ err, id: row.id }, 'unexpected processRow error')
-					))
-				)
-			)
+			log.debug({ n: claimed.length, inFlight: this.inFlight.size }, 'claimed processing rows')
+			for (const row of claimed) {
+				const job: Promise<void> = this.processRow(row)
+					.catch(err => log.error({ err, id: row.id }, 'unexpected processRow error'))
+					.finally(() => {
+						this.inFlight.delete(job)
+						this.notify()
+					})
+				this.inFlight.add(job)
+			}
 		}
 	}
 
-	private async claimBatch(): Promise<ClaimRow[]> {
+	private async claimBatch(limit: number): Promise<ClaimRow[]> {
 		const rows = await db.execute<ClaimRow>(sql`
 			WITH ready AS (
 				SELECT id
@@ -131,9 +157,13 @@ export class ProcessingWorker {
 				WHERE status = 'pending'
 				  AND account_id = ${this.ctx.accountId}
 				  AND next_attempt_at <= NOW()
-				ORDER BY next_attempt_at
+				-- Live media first (history backfill can queue hundreds of rows),
+				-- voice notes first among those: they're tiny and a reply waits on them.
+				ORDER BY (inserted_at > NOW() - INTERVAL '15 minutes') DESC,
+				         (processor = 'elevenlabs_audio') DESC,
+				         next_attempt_at
 				FOR UPDATE SKIP LOCKED
-				LIMIT ${this.cfg.batchSize}
+				LIMIT ${limit}
 			)
 			UPDATE wa.media_processing m
 			SET status   = 'in_progress',
@@ -271,6 +301,11 @@ export class ProcessingWorker {
 	}
 
 	private async sleepUntilWake(maxMs: number): Promise<void> {
+		if (this.wakePending) {
+			this.wakePending = false
+			await sleep(0)
+			return
+		}
 		await new Promise<void>(resolve => {
 			const timer = setTimeout(() => {
 				this.wakeResolve = null

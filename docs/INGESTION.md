@@ -236,7 +236,9 @@ history sync ────┘
          ChatStore.notify() ───► MediaWorker.notify() (wakes idle poll)
                                           │
                                           ▼
-       claim batch via FOR UPDATE SKIP LOCKED  (status pending → in_progress)
+       claim up to <free slots> rows via FOR UPDATE SKIP LOCKED  (pending → in_progress)
+       order: media from the last 15 min first, voice notes first, then next_attempt_at;
+       each row runs as soon as a slot frees (no waiting on the rest of a batch)
                                           │
                                           ▼
        SELECT raw_envelope, raw_message FROM wa.messages   (rebuild WAMessage)

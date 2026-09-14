@@ -1,7 +1,6 @@
 import { hostname } from 'node:os'
 import { setTimeout as sleep } from 'node:timers/promises'
 
-import pLimit from 'p-limit'
 import { sql } from 'drizzle-orm'
 import type { WASocket } from 'baileys'
 
@@ -36,10 +35,12 @@ const backoffSeconds = (attempt: number): number =>
 
 export class MediaWorker {
 	private readonly workerId = `${hostname()}-${process.pid}`
-	private readonly limiter: ReturnType<typeof pLimit>
 	private readonly allowedTypes: ReadonlySet<string>
 	private running = false
 	private wakeResolve: (() => void) | null = null
+	/** A notify() that arrived while the loop wasn't sleeping; consumed by the next sleep. */
+	private wakePending = false
+	private readonly inFlight = new Set<Promise<void>>()
 	private getSocket: () => WASocket | null = () => null
 	private loopPromise: Promise<void> | null = null
 	private stopping = false
@@ -49,7 +50,6 @@ export class MediaWorker {
 		private readonly storage: MediaStorage,
 		private readonly cfg: MediaConfig
 	) {
-		this.limiter = pLimit(cfg.concurrency)
 		this.allowedTypes = new Set(cfg.types)
 	}
 
@@ -89,6 +89,8 @@ export class MediaWorker {
 		if (this.wakeResolve) {
 			this.wakeResolve()
 			this.wakeResolve = null
+		} else {
+			this.wakePending = true
 		}
 	}
 
@@ -100,6 +102,9 @@ export class MediaWorker {
 		this.notify()
 		try {
 			await this.loopPromise
+			// Let in-flight jobs finish, but never hold shutdown hostage: an
+			// unfinished job's lease expires and it is retried after restart.
+			await Promise.race([Promise.allSettled([...this.inFlight]), sleep(20_000)])
 		} finally {
 			this.loopPromise = null
 		}
@@ -107,6 +112,7 @@ export class MediaWorker {
 	}
 
 	private async loop(): Promise<void> {
+		let lastReapAt = 0
 		while (this.running) {
 			// If the storage backend is a no-op (no bucket configured), don't
 			// claim rows at all — they'd burn through the attempt budget for
@@ -117,13 +123,25 @@ export class MediaWorker {
 				continue
 			}
 
-			// First reap any expired leases so crashed workers' rows come back.
-			await this.reapExpiredLeases().catch(err =>
-				log.warn({ err }, 'lease reaper failed')
-			)
+			// Claim only as many rows as there are free slots, and start each job
+			// as soon as a slot frees up. (Previously a whole batch was awaited,
+			// so one slow video or image held every voice note behind it.)
+			const free = this.cfg.concurrency - this.inFlight.size
+			if (free <= 0) {
+				await this.sleepUntilWake(this.cfg.pollIntervalMs)
+				continue
+			}
 
-			const claimed = await this.claimBatch().catch(err => {
-				log.error({ err }, 'claim batch failed')
+			if (Date.now() - lastReapAt > 30_000) {
+				lastReapAt = Date.now()
+				// Reap expired leases so crashed workers' rows come back.
+				await this.reapExpiredLeases().catch(err =>
+					log.warn({ err }, 'media lease reaper failed')
+				)
+			}
+
+			const claimed = await this.claimBatch(Math.min(free, this.cfg.batchSize)).catch(err => {
+				log.error({ err }, 'media claim batch failed')
 				return [] as ClaimRow[]
 			})
 
@@ -133,24 +151,25 @@ export class MediaWorker {
 				continue
 			}
 
-			log.debug({ n: claimed.length }, 'claimed media batch')
-			await Promise.all(
-				claimed.map(row =>
-					this.limiter(() => this.processRow(row).catch(err =>
-						log.error({ err, mediaId: row.id }, 'unexpected processRow error')
-					))
-				)
-			)
+			log.debug({ n: claimed.length, inFlight: this.inFlight.size }, 'claimed media rows')
+			for (const row of claimed) {
+				const job: Promise<void> = this.processRow(row)
+					.catch(err => log.error({ err, id: row.id }, 'unexpected processRow error'))
+					.finally(() => {
+						this.inFlight.delete(job)
+						this.notify()
+					})
+				this.inFlight.add(job)
+			}
 		}
 	}
 
 	/**
-	 * Atomically claim up to batchSize ready rows using FOR UPDATE SKIP LOCKED.
+	 * Atomically claim up to `limit` ready rows using FOR UPDATE SKIP LOCKED.
 	 * Sets download_status='in_progress', stamps lease_until, increments attempts.
 	 */
-	private async claimBatch(): Promise<ClaimRow[]> {
+	private async claimBatch(limit: number): Promise<ClaimRow[]> {
 		const leaseSeconds = this.cfg.leaseSeconds
-		const batch = this.cfg.batchSize
 		const workerId = this.workerId
 		const accountId = this.ctx.accountId
 
@@ -161,9 +180,13 @@ export class MediaWorker {
 				WHERE download_status = 'pending'
 				  AND account_id = ${accountId}
 				  AND next_attempt_at <= NOW()
-				ORDER BY next_attempt_at
+				-- Live media first (history backfill can queue hundreds of rows),
+				-- voice notes first among those: they're tiny and a reply waits on them.
+				ORDER BY (inserted_at > NOW() - INTERVAL '15 minutes') DESC,
+				         (media_type = 'audio') DESC,
+				         next_attempt_at
 				FOR UPDATE SKIP LOCKED
-				LIMIT ${batch}
+				LIMIT ${limit}
 			)
 			UPDATE wa.media m
 			SET download_status   = 'in_progress',
@@ -267,6 +290,11 @@ export class MediaWorker {
 	}
 
 	private async sleepUntilWake(maxMs: number): Promise<void> {
+		if (this.wakePending) {
+			this.wakePending = false
+			await sleep(0)
+			return
+		}
 		await new Promise<void>(resolve => {
 			const timer = setTimeout(() => {
 				this.wakeResolve = null

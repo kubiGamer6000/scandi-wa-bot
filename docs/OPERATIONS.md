@@ -74,10 +74,11 @@ watch `wa.sync_state.history_progress_pct` climb to 100 and then
 | `ELEVENLABS_API_KEY`      | _(empty)_          | Enables audio transcription via ElevenLabs Scribe.                                 |
 | `LLAMA_CLOUD_API_KEY`     | _(empty)_          | Enables document-to-markdown via LlamaParse.                                       |
 | `PROCESSING_ENABLED`      | auto               | Master switch. Defaults to ON when any AI key is set.                              |
-| `PROCESSING_MODEL_VIDEO`  | `gemini-2.5-flash` | Gemini model for video + image analysis.                                           |
+| `PROCESSING_MODEL_VIDEO`  | `gemini-2.5-flash` | Gemini model for video (and images unless `PROCESSING_MODEL_IMAGE` is set).                                           |
+| `PROCESSING_MODEL_IMAGE`  | video model        | Gemini model for images/stickers. A Flash model (~4s) keeps replies to images fast. |
 | `PROCESSING_MODEL_AUDIO`  | `scribe_v2`        | ElevenLabs model for transcription.                                                |
 | `PROCESSING_LLAMAPARSE_TIER` | `agentic`       | LlamaParse tier (`fast`/`cost_effective`/`agentic`/`agentic_plus`).                 |
-| `PROCESSING_CONCURRENCY`  | `2`                | Parallel AI calls.                                                                 |
+| `PROCESSING_CONCURRENCY`  | `4`                | Parallel AI calls. Slots refill as each call finishes; live media and voice notes are claimed first. |
 | `PROCESSING_LEASE_SECONDS`| `600`              | 10-minute lease (AI calls are slow).                                               |
 | `PROCESSING_MAX_ATTEMPTS` | `4`                | Backoff: 1m → 5m → 30m → 2h, then `failed`.                                       |
 

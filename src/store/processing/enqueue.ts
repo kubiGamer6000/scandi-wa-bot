@@ -1,3 +1,5 @@
+import { EventEmitter } from 'node:events'
+
 import { schema } from '../../db/index.js'
 import { config, type ProcessingConfig } from '../../config.js'
 import { childLogger } from '../../logger.js'
@@ -5,6 +7,12 @@ import { getVideoPrompt, getImagePrompt } from './prompts.js'
 import type { StoreContext } from '../types.js'
 
 const log = childLogger('store:processing:enqueue')
+
+/**
+ * Fires after a processing job is inserted, so the processing worker starts it
+ * immediately instead of on its next idle poll.
+ */
+export const processingEnqueued = new EventEmitter()
 
 interface MediaDoneRow {
 	id: bigint
@@ -61,7 +69,7 @@ const route = (row: MediaDoneRow, cfg: ProcessingConfig): RouteResult | null => 
 			if (!cfg.geminiApiKey) return null
 			return {
 				processor: 'gemini_image',
-				model: cfg.geminiModel,
+				model: cfg.geminiImageModel,
 				prompt: getImagePrompt()
 			}
 
@@ -120,6 +128,7 @@ export const enqueueProcessing = async (
 			})
 			.onConflictDoNothing()
 
+		processingEnqueued.emit('enqueued')
 		log.debug(
 			{ mediaId: String(row.id), processor: resolved.processor, model: resolved.model },
 			'processing job enqueued'

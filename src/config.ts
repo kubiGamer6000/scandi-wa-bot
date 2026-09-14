@@ -210,6 +210,8 @@ export interface ProcessingConfig {
 	readonly enabled: boolean
 	readonly geminiApiKey: string | null
 	readonly geminiModel: string
+	/** Model for images/stickers. Defaults to `geminiModel`; a Flash model is much faster. */
+	readonly geminiImageModel: string
 	readonly elevenlabsApiKey: string | null
 	readonly elevenlabsModel: string
 	readonly llamaCloudApiKey: string | null
@@ -235,11 +237,17 @@ const buildProcessingConfig = (): ProcessingConfig => {
 		enabled,
 		geminiApiKey,
 		geminiModel: process.env.PROCESSING_MODEL_VIDEO?.trim() || 'gemini-2.5-flash',
+		geminiImageModel:
+			process.env.PROCESSING_MODEL_IMAGE?.trim() ||
+			process.env.PROCESSING_MODEL_VIDEO?.trim() ||
+			'gemini-2.5-flash',
 		elevenlabsApiKey,
 		elevenlabsModel: process.env.PROCESSING_MODEL_AUDIO?.trim() || 'scribe_v2',
 		llamaCloudApiKey,
 		llamaParseTier: parseLlamaParseTier(process.env.PROCESSING_LLAMAPARSE_TIER),
-		concurrency: Math.max(1, parseIntEnv(process.env.PROCESSING_CONCURRENCY, 2)),
+		// AI calls are network-bound; four at once keeps a slow video from
+		// holding up voice notes behind it.
+		concurrency: Math.max(1, parseIntEnv(process.env.PROCESSING_CONCURRENCY, 4)),
 		batchSize: Math.max(1, parseIntEnv(process.env.PROCESSING_BATCH_SIZE, 5)),
 		pollIntervalMs: Math.max(1000, parseIntEnv(process.env.PROCESSING_POLL_MS, 10_000)),
 		leaseSeconds: Math.max(60, parseIntEnv(process.env.PROCESSING_LEASE_SECONDS, 600)),
