@@ -27,6 +27,18 @@ const log = childLogger('bot')
 /** Backoff sequence (ms) used between reconnect attempts. */
 const RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 30_000] as const
 
+/**
+ * Give up on in-process reconnects after this many consecutive failures AND
+ * this long without an open connection, and exit so systemd restarts us.
+ *
+ * Why: after some stream errors Baileys reconnects, reports "logging in…",
+ * never completes the login, and closes with 428 a minute later — forever.
+ * On 2026-09-17 that loop ran ~430 times over 11 hours (and earlier for days)
+ * while a fresh process logged in within a second.
+ */
+const RECONNECT_EXIT_AFTER_ATTEMPTS = 5
+const RECONNECT_EXIT_AFTER_MS = 5 * 60_000
+
 const pickBrowser = (): [string, string, string] => {
 	switch (config.browser.platform) {
 		case 'macOS':
@@ -50,6 +62,10 @@ export class Bot {
 	private sock: WASocket | undefined
 	private shuttingDown = false
 	private reconnectAttempt = 0
+	/** True only between `connection: open` and the next close. */
+	private connectionOpen = false
+	/** When the current outage started; null while connected. */
+	private disconnectedSince: number | null = Date.now()
 	private store: ChatStore | undefined
 	private auth: AuthHandle | undefined
 	private mediaWorker: MediaWorker | undefined
@@ -71,9 +87,18 @@ export class Bot {
 		config.markOnlineOnConnect ? 'available' : 'unavailable'
 	)
 
-	/** Exposed so the API send route can hold a closure that follows reconnects. */
+	/**
+	 * The socket, but only while the connection is actually open. A socket
+	 * object exists during connect/login too, and API calls made then hang
+	 * instead of failing fast with 503.
+	 */
 	getSock(): WASocket | null {
-		return this.sock ?? null
+		return this.connectionOpen ? (this.sock ?? null) : null
+	}
+
+	/** Epoch ms when the current outage began, or null while connected. */
+	getDisconnectedSince(): number | null {
+		return this.disconnectedSince
 	}
 
 	/** Exposed for the presence API routes, which drive typing indicators. */
@@ -143,7 +168,8 @@ export class Bot {
 			this.webhookWorker.start()
 
 			this.apiServer = await buildServer({
-				getSock: () => this.sock ?? null,
+				getSock: () => this.getSock(),
+				getDisconnectedSince: () => this.getDisconnectedSince(),
 				store: this.store,
 				storage: this.mediaStorage,
 				typing: this.typing
@@ -297,13 +323,21 @@ export class Bot {
 
 		if (connection === 'open') {
 			this.reconnectAttempt = 0
+			this.connectionOpen = true
+			this.disconnectedSince = null
 			const me = this.sock?.user
 			log.info({ me: me?.id, lid: me?.lid, name: me?.name }, 'connection opened')
+			void this.store?.markActive().catch(err =>
+				log.warn({ err }, 'failed to mark account active in DB')
+			)
 			void this.readReceipts.checkPrivacy()
 			return
 		}
 
 		if (connection !== 'close') return
+
+		this.connectionOpen = false
+		this.disconnectedSince ??= Date.now()
 
 		// The socket is gone, so every chatstate we pushed is void. Drop the
 		// sessions instead of refreshing into a dead connection.
@@ -335,6 +369,18 @@ export class Bot {
 				'WhatsApp rejected the client version (405 client_too_old). ' +
 					'Next connect will re-fetch web.whatsapp.com/sw.js.'
 			)
+		}
+
+		const downMs = Date.now() - (this.disconnectedSince ?? Date.now())
+		if (
+			this.reconnectAttempt >= RECONNECT_EXIT_AFTER_ATTEMPTS &&
+			downMs >= RECONNECT_EXIT_AFTER_MS
+		) {
+			log.error(
+				{ attempts: this.reconnectAttempt, downMs, statusCode },
+				'reconnect loop: no open connection after repeated attempts — exiting so systemd restarts the bot with a fresh process'
+			)
+			process.exit(1)
 		}
 
 		const idx = Math.min(this.reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)

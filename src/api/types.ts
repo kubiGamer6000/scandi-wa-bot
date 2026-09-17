@@ -7,12 +7,14 @@ import type { ChatStore } from '../store/index.js'
 import type { MediaStorage } from '../store/media/storage.js'
 import type { TypingManager } from '../presence/index.js'
 
-/** Returns the current Baileys socket, or null if not yet connected. */
+/** Returns the Baileys socket while the connection is open, else null. */
 export type GetSock = () => WASocket | null
 
 /** Dependencies injected into the Fastify server at build time. */
 export interface ApiDeps {
 	getSock: GetSock
+	/** Epoch ms when the current WhatsApp outage began; null while connected. */
+	getDisconnectedSince?: () => number | null
 	store: ChatStore
 	storage: MediaStorage
 	typing: TypingManager

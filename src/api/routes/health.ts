@@ -9,6 +9,10 @@ const { accounts, syncState } = schema
 const HealthReply = Type.Object({
 	status: Type.Literal('ok'),
 	sock_connected: Type.Boolean(),
+	/** ISO time the WhatsApp connection dropped; null while connected. */
+	disconnected_since: Type.Union([Type.String(), Type.Null()]),
+	/** False when the DB didn't answer within the health deadline. */
+	db_ok: Type.Boolean(),
 	account_label: Type.String(),
 	last_event_at: Type.Union([Type.String(), Type.Null()]),
 	initial_sync_done: Type.Boolean(),
@@ -36,27 +40,40 @@ export const registerHealthRoutes = async (
 		async () => {
 			const accountId = deps.store.accountId
 
-			const [acct] = await db
+			// Health must always answer, even when the DB pool is wedged —
+			// otherwise it hangs exactly when someone needs to see what's wrong.
+			const withDeadline = <T>(query: Promise<T>): Promise<T | null> =>
+				Promise.race([
+					query,
+					new Promise<null>(resolve => setTimeout(() => resolve(null), 3_000).unref())
+				]).catch(() => null)
+
+			const acctRows = await withDeadline(db
 				.select({
 					label: accounts.label,
 					status: accounts.status
 				})
 				.from(accounts)
 				.where(eq(accounts.id, accountId))
-				.limit(1)
+				.limit(1))
 
-			const [sync] = await db
+			const syncRows = await withDeadline(db
 				.select({
 					lastEventAt: syncState.lastEventAt,
 					initialSyncDone: syncState.initialSyncDone
 				})
 				.from(syncState)
 				.where(eq(syncState.accountId, accountId))
-				.limit(1)
+				.limit(1))
+			const acct = acctRows?.[0]
+			const sync = syncRows?.[0]
+			const since = deps.getDisconnectedSince?.() ?? null
 
 			return {
 				status: 'ok' as const,
 				sock_connected: deps.getSock() != null,
+				disconnected_since: since === null ? null : new Date(since).toISOString(),
+				db_ok: acctRows !== null && syncRows !== null,
 				account_label: acct?.label ?? 'unknown',
 				last_event_at: sync?.lastEventAt?.toISOString() ?? null,
 				initial_sync_done: sync?.initialSyncDone ?? false,

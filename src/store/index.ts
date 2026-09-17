@@ -258,6 +258,11 @@ export class ChatStore {
 		await markAccountStatus(db, this.accountId, 'logged_out')
 	}
 
+	/** Called when a connection opens, so a past logout doesn't linger in health. */
+	async markActive(): Promise<void> {
+		await markAccountStatus(db, this.accountId, 'active')
+	}
+
 	async heartbeat(): Promise<void> {
 		await updateSyncState(this.ctx, { lastEventAt: new Date() })
 	}

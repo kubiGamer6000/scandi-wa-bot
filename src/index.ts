@@ -9,6 +9,12 @@ const main = async (): Promise<void> => {
 
 	const shutdown = async (signal: string): Promise<void> => {
 		logger.info({ signal }, 'received shutdown signal')
+		// Never hang shutdown: systemd would SIGKILL after 90s anyway, and a
+		// stuck worker or socket shouldn't delay a restart that long.
+		setTimeout(() => {
+			logger.warn('shutdown deadline reached — exiting')
+			process.exit(0)
+		}, 25_000).unref()
 		await bot.stop()
 		await closeDb().catch(err => logger.warn({ err }, 'error closing DB pool (ignored)'))
 		process.exit(0)
