@@ -84,7 +84,7 @@ const main = async (): Promise<void> => {
 					lastUsed: schema.apiKeys.lastUsedAt,
 					revoked: schema.apiKeys.revokedAt,
 					sent24h: sql<number>`(select count(*)::int from wa.notifications n
-						where n.api_key_id = ${schema.apiKeys.id} and n.status = 'sent'
+						where n.api_key_id = wa.api_keys.id and n.status = 'sent'
 						and n.created_at > now() - interval '24 hours')`
 				})
 				.from(schema.apiKeys)
