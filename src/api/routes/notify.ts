@@ -1,4 +1,4 @@
-import { and, eq, sql } from 'drizzle-orm'
+import { and, desc, eq, sql } from 'drizzle-orm'
 import { Type } from '@sinclair/typebox'
 
 import { config } from '../../config.js'
@@ -52,6 +52,8 @@ const StatusReply = Type.Object({
 	wa_message_id: Type.Union([Type.String(), Type.Null()]),
 	error: Type.Union([Type.String(), Type.Null()]),
 	created_at: Type.String(),
+	/** WhatsApp's own status for the message: pending → server_ack → delivered → read / played. */
+	delivery_status: Type.Union([Type.String(), Type.Null()]),
 	delivered_at: Type.Union([Type.String(), Type.Null()]),
 	read_at: Type.Union([Type.String(), Type.Null()])
 })
@@ -189,6 +191,20 @@ export const registerNotifyRoutes = async (app: TypedFastify, deps: ApiDeps): Pr
 				toJid = jid
 			}
 
+			// Prefer the person's LID when we know it. WhatsApp addresses
+			// existing 1:1 chats by LID: sending to the phone-number form puts
+			// the message in a second chat record, and its delivered/read
+			// acknowledgements (which arrive keyed by LID) never reach it.
+			if (toJid.endsWith('@s.whatsapp.net')) {
+				const [mapping] = await db
+					.select({ lid: schema.lidMappings.lid })
+					.from(schema.lidMappings)
+					.where(and(eq(schema.lidMappings.accountId, accountId), eq(schema.lidMappings.pn, toJid)))
+					.orderBy(desc(schema.lidMappings.observedAt))
+					.limit(1)
+				if (mapping?.lid) toJid = mapping.lid
+			}
+
 			const [{ count: toRecipient = 0 } = { count: 0 }] = await db
 				.select({ count: sql<number>`count(*)::int` })
 				.from(schema.notifications)
@@ -281,6 +297,16 @@ export const registerNotifyRoutes = async (app: TypedFastify, deps: ApiDeps): Pr
 
 			let deliveredAt: string | null = null
 			let readAt: string | null = null
+			let deliveryStatus: string | null = null
+			if (n.waMessageId) {
+				// 1:1 chats report delivery/read as a status on the message itself.
+				const [m] = await db
+					.select({ status: schema.messages.status })
+					.from(schema.messages)
+					.where(and(eq(schema.messages.accountId, accountId), eq(schema.messages.id, n.waMessageId)))
+					.limit(1)
+				deliveryStatus = m?.status === 'delivery_ack' ? 'delivered' : (m?.status ?? null)
+			}
 			if (n.waMessageId && n.toJid) {
 				const receipts = await db
 					.select({ type: schema.messageReceipts.receiptType, ts: schema.messageReceipts.ts })
@@ -307,6 +333,7 @@ export const registerNotifyRoutes = async (app: TypedFastify, deps: ApiDeps): Pr
 				wa_message_id: n.waMessageId,
 				error: n.error,
 				created_at: n.createdAt.toISOString(),
+				delivery_status: deliveryStatus,
 				delivered_at: deliveredAt,
 				read_at: readAt
 			}

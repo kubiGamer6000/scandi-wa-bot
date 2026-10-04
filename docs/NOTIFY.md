@@ -98,13 +98,22 @@ Authorization: Bearer wak_…
 ```
 
 ```json
-{ "id": 42, "status": "sent", "to": "46701234567@s.whatsapp.net", "wa_message_id": "3EB0…",
-  "error": null, "created_at": "…", "delivered_at": "…", "read_at": "…" }
+{ "id": 42, "status": "sent", "to": "173065942106213@lid", "wa_message_id": "3EB0…",
+  "error": null, "created_at": "…", "delivery_status": "read",
+  "delivered_at": null, "read_at": null }
 ```
 
-`delivered_at` / `read_at` come from WhatsApp receipts. `read_at` stays null when
-the recipient has read receipts turned off. A key only sees its own
-notifications.
+`status` is this API's view (`pending` while sending, then `sent` or `failed`).
+`delivery_status` is WhatsApp's: `pending` → `server_ack` (accepted by WhatsApp)
+→ `delivered` (on their phone) → `read` / `played`. It stops at `delivered` when
+the recipient has read receipts turned off. `delivered_at` / `read_at` are filled
+only when WhatsApp reports a timestamp (mostly group-style receipts), so rely on
+`delivery_status`. A key only sees its own notifications.
+
+`to` in responses may be a `…@lid` id rather than the phone number: when the bot
+already knows the person, it addresses their existing chat by LID (WhatsApp's
+internal id), which keeps the conversation in one thread and makes delivery
+status work.
 
 ## Limits
 
