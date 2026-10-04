@@ -299,30 +299,44 @@ curl -X POST http://127.0.0.1:8787/v1/webhooks \
 
 ## 4. Authentication
 
-A single static bearer token authenticates **every** endpoint except
-`GET /v1/health`.
+Every endpoint except `GET /v1/health` needs a bearer token. There are two
+kinds:
+
+| Credential | Access | Accepted from |
+|---|---|---|
+| Master token (`API_AUTH_TOKEN`) | every route | **this host only** — a direct loopback connection. Requests that came through the public proxy (Caddy adds `X-Forwarded-For`) are refused, so a leaked master token is useless from the internet. `API_MASTER_TOKEN_REMOTE=true` lifts this. |
+| Scoped key (`wak_…`, `wa.api_keys`) | only the routes its scopes grant | anywhere |
 
 ```
-Authorization: Bearer <API_AUTH_TOKEN>
+Authorization: Bearer <API_AUTH_TOKEN | wak_…>
 ```
 
-| Condition               | Response               |
-| ----------------------- | ---------------------- |
-| No `Authorization` hdr  | `401 Unauthorized`     |
-| Wrong scheme / format   | `401 Unauthorized`     |
-| Wrong token             | `403 Forbidden`        |
+| Condition | Response |
+|---|---|
+| No `Authorization` header / wrong scheme | `401 Unauthorized` |
+| Wrong, unknown or revoked token | `403 Forbidden` |
+| Master token from outside the host | `403 Forbidden` |
+| Scoped key on a route outside its scopes | `403 Forbidden` |
 
-The comparison is constant-time (`timingSafeEqual`), so timing attacks
-won't recover the token byte-by-byte.
+Comparisons are constant-time; scoped keys are looked up by sha256 (only the
+hash is stored).
 
-### 4.1 Token hygiene
+### 4.1 Scopes
 
-- Treat the token as a database password. Never commit it. Never log it.
+| Scope | Routes |
+|---|---|
+| `notify` | `POST /v1/notify`, `GET /v1/notify/:id` — see [NOTIFY.md](./NOTIFY.md) |
+
+Manage keys on the droplet with `npm run api-key -- create|list|revoke`.
+
+### 4.2 Token hygiene
+
+- Treat both kinds as passwords. Never commit them. Never log them.
 - Bind the API to `127.0.0.1` (default) and terminate TLS at a reverse
-  proxy (Caddy, Nginx, Cloudflare Tunnel). Don't expose `:8787` to the
-  internet directly.
-- To rotate: change `API_AUTH_TOKEN` in `.env`, restart, update every
-  consumer. Multi-token / scoped auth is on the roadmap.
+  proxy. Don't expose `:8787` directly.
+- Give each external app its own scoped key; revoke one without touching the
+  others. Rotating the master token means changing `API_AUTH_TOKEN` and every
+  on-host consumer (Jarvis's `WA_BOT_TOKEN`).
 
 ---
 

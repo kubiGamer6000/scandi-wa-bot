@@ -16,7 +16,7 @@ type MediaKind = (typeof MEDIA_KINDS)[number]
  * it to land before returning. 3s is generous — the upsert is typically
  * sub-50ms after `sendMessage()` resolves.
  */
-const waitForSeq = async (
+export const waitForSeq = async (
 	accountId: string,
 	chatJid: string,
 	waMessageId: string,

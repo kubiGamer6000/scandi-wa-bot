@@ -391,6 +391,46 @@ export const webhookSubscriptions = wa.table('webhook_subscriptions', {
  * Durable webhook delivery queue, drained by `WebhookWorker` with
  * `FOR UPDATE SKIP LOCKED` + exponential backoff. At-least-once semantics.
  */
+/**
+ * Scoped API keys for external apps (see 0006_notify_api.sql). Only the
+ * sha256 of a key is stored.
+ */
+export const apiKeys = wa.table('api_keys', {
+	id: uuid('id').primaryKey().defaultRandom(),
+	accountId: uuid('account_id')
+		.notNull()
+		.references(() => accounts.id, { onDelete: 'cascade' }),
+	label: text('label').notNull(),
+	keyPrefix: text('key_prefix').notNull(),
+	keyHash: text('key_hash').notNull().unique(),
+	scopes: text('scopes').array().notNull(),
+	ratePerMinute: integer('rate_per_minute').notNull().default(30),
+	ratePerDay: integer('rate_per_day').notNull().default(1000),
+	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+	lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
+	revokedAt: timestamp('revoked_at', { withTimezone: true })
+})
+
+/** Audit log + idempotency for POST /v1/notify. */
+export const notifications = wa.table('notifications', {
+	id: bigserial('id', { mode: 'bigint' }).primaryKey(),
+	accountId: uuid('account_id')
+		.notNull()
+		.references(() => accounts.id, { onDelete: 'cascade' }),
+	apiKeyId: uuid('api_key_id')
+		.notNull()
+		.references(() => apiKeys.id, { onDelete: 'cascade' }),
+	idempotencyKey: text('idempotency_key'),
+	toInput: text('to_input').notNull(),
+	toJid: text('to_jid'),
+	textChars: integer('text_chars').notNull(),
+	status: text('status').notNull(),
+	error: text('error'),
+	waMessageId: text('wa_message_id'),
+	seq: bigint('seq', { mode: 'number' }),
+	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
+})
+
 export const webhookDeliveries = wa.table('webhook_deliveries', {
 	id: bigserial('id', { mode: 'bigint' }).primaryKey(),
 	subscriptionId: uuid('subscription_id')

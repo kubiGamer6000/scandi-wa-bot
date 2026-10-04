@@ -15,7 +15,9 @@
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist",
     "recon": "tsx src/recon/index.ts",
-    "render": "tsx src/render/index.ts"
+    "render": "tsx src/render/index.ts",
+    "api-key": "tsx src/cli/api-keys.ts",
+    "test:format": "tsx scripts/format-check.ts"
   },
   "dependencies": {
     "@elevenlabs/elevenlabs-js": "^2.46.0",

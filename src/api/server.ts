@@ -5,7 +5,7 @@ import type { TypeBoxTypeProvider } from '@fastify/type-provider-typebox'
 
 import { config } from '../config.js'
 import { logger } from '../logger.js'
-import { registerBearerAuth } from './auth.js'
+import { registerAuth } from './auth.js'
 import { registerHealthRoutes } from './routes/health.js'
 import { registerChatRoutes } from './routes/chats.js'
 import { registerMessageRoutes } from './routes/messages.js'
@@ -13,6 +13,7 @@ import { registerSendRoute } from './routes/send.js'
 import { registerActionRoutes } from './routes/actions.js'
 import { registerPresenceRoutes } from './routes/presence.js'
 import { registerWebhookRoutes } from './routes/webhooks.js'
+import { registerNotifyRoutes } from './routes/notify.js'
 import type { ApiDeps, TypedFastify } from './types.js'
 
 /**
@@ -47,7 +48,11 @@ export const buildServer = async (deps: ApiDeps): Promise<FastifyInstance> => {
 		}
 	})
 
-	registerBearerAuth(app, authToken)
+	registerAuth(app, {
+		masterToken: authToken,
+		accountId: deps.store.accountId,
+		allowRemoteMaster: config.api.allowRemoteMaster
+	})
 
 	// Mount domain routes. Each route module is self-contained and only
 	// touches its own URL prefix; the order here is purely cosmetic.
@@ -58,6 +63,7 @@ export const buildServer = async (deps: ApiDeps): Promise<FastifyInstance> => {
 	await registerActionRoutes(app, deps)
 	await registerPresenceRoutes(app, deps)
 	await registerWebhookRoutes(app, deps)
+	await registerNotifyRoutes(app, deps)
 
 	// Catchall error handler. Fastify defaults are fine, but we want every
 	// error to flow through pino with structured context for observability.

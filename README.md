@@ -78,6 +78,8 @@ npm run render -- +359884430293
 | `npm run typecheck`| `tsc --noEmit`.                                                |
 | `npm run render`   | Render a conversation by phone or JID to Markdown in `out/`.   |
 | `npm run recon`    | Dump raw Baileys events as JSONL for offline analysis.         |
+| `npm run api-key`  | Create / list / revoke scoped API keys (`-- create "<app>"`). |
+| `npm run test:format` | Checks for the notify formatter and phone parsing.          |
 
 ## Deeper documentation
 
@@ -90,6 +92,7 @@ npm run render -- +359884430293
 | [`docs/OPERATIONS.md`](docs/OPERATIONS.md)     | Setup, monitoring, troubleshooting, common ops queries.                             |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)     | Production runbook: DigitalOcean droplet, hardening, systemd, atomic deploys.       |
 | [`docs/API.md`](docs/API.md)                   | Full external integration guide: WhatsApp/Baileys primer, every endpoint, webhook contract & signing, media model, integration recipes, error catalog. |
+| [`docs/NOTIFY.md`](docs/NOTIFY.md)             | Send-only notification API for other apps (scoped keys, formatting, limits, examples). |
 
 ## Status, scope, what isn't built yet
 

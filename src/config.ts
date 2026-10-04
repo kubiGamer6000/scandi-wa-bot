@@ -113,6 +113,13 @@ export interface ApiConfig {
 	readonly authToken: string | null
 	/** Cap on inbound request bodies (multipart for media uploads). */
 	readonly maxBodyBytes: number
+	/**
+	 * Accept the master token on requests that came through the public reverse
+	 * proxy. Off by default: external apps use scoped keys (`npm run api-key`).
+	 */
+	readonly allowRemoteMaster: boolean
+	/** POST /v1/notify: max sends to one recipient per hour (all keys combined). */
+	readonly notifyPerRecipientPerHour: number
 }
 
 export interface WebhookConfig {
@@ -268,7 +275,9 @@ const buildApiConfig = (): ApiConfig => {
 		host: process.env.API_HOST?.trim() || '127.0.0.1',
 		port: Math.max(1, parseIntEnv(process.env.API_PORT, 8787)),
 		authToken,
-		maxBodyBytes: Math.max(1, parseIntEnv(process.env.API_MAX_BODY_MB, 25)) * 1024 * 1024
+		maxBodyBytes: Math.max(1, parseIntEnv(process.env.API_MAX_BODY_MB, 25)) * 1024 * 1024,
+		allowRemoteMaster: parseBool(process.env.API_MASTER_TOKEN_REMOTE, false),
+		notifyPerRecipientPerHour: Math.max(1, parseIntEnv(process.env.NOTIFY_PER_RECIPIENT_PER_HOUR, 20))
 	}
 }
 
