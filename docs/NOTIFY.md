@@ -5,7 +5,7 @@ through the Scandi bot account (the same account Jarvis uses). Built for the
 editor app: "a new video was assigned to you", "your edit was approved", etc.
 
 The calling app owns everything about *who* gets notified and *when*. This API
-only delivers a message to a phone number, safely.
+only delivers a message to a phone number or WhatsApp username, safely.
 
 ```
 POST https://wa-api.scandigum.com/v1/notify
@@ -47,10 +47,42 @@ a leak is one revoke away and every message is attributable.
 
 | Field | Required | Notes |
 |---|---|---|
-| `to` | yes | Phone number in international format — `+46701234567`, `0046 70 123 45 67`, `+1 (415) 555-0100` all work. Must include the country code. An individual WhatsApp JID (`…@s.whatsapp.net` / `…@lid`) is accepted too. Groups are refused. |
+| `to` | yes | Phone number in international format — `+46701234567`, `0046 70 123 45 67`, `+1 (415) 555-0100` all work. Must include the country code. An individual WhatsApp JID (`…@s.whatsapp.net` / `…@lid`) is accepted too. Or a WhatsApp username: `"@handle"`, or `{ "username": "handle", "key": "1234" }` when the person has set a username PIN. Groups are refused. |
 | `text` | yes | Up to 4096 characters after formatting. |
 | `format` | no | `"whatsapp"` (default, sent as-is) or `"markdown"` (converted, see below). |
 | `idempotency_key` | no, recommended | Any string ≤ 200 chars, unique per logical notification (e.g. `assignment-<id>`). Also accepted as an `Idempotency-Key` header. |
+
+### Usernames
+
+People who hide their phone number can be reached by their WhatsApp username.
+Usernames are 3–35 characters of `a–z`, `0–9`, `.` and `_` with at least one
+letter; case and a leading `@` are ignored.
+
+```json
+{ "to": "@rex.edits", "text": "New video assigned", "idempotency_key": "assignment-8813" }
+{ "to": { "username": "rex.edits", "key": "1234" }, "text": "…" }
+```
+
+The bot resolves the username to the person's account (their `…@lid`) and
+sends there; the response's `to` is that JID. Resolution, cheapest first:
+
+1. **Already known.** Usernames WhatsApp attaches to contacts and to messages
+   people send the bot are recorded in `wa.usernames`, so anyone who has
+   messaged the bot resolves without a lookup. This is also the most reliable
+   path: ask people to message the bot once.
+2. **Lookup.** Otherwise the bot asks WhatsApp (a USync contact query by
+   username, the same lookup the app's "message by username" uses), sending
+   the `key` if given. Hits are stored in `wa.usernames`.
+
+Lookups are cached: hits for 6 hours in memory and durably in `wa.usernames`
+(a stored username is re-checked with WhatsApp 30 days after it was last seen,
+since usernames can change hands); misses for 15 minutes.
+
+A username nobody can resolve returns **422** with
+`{ "error": "username_not_found", "message": "username not found: @handle …" }`.
+Common causes: a typo, a changed username, or a username PIN that wasn't sent.
+Storing the `…@lid` from the first successful response and sending to it
+afterwards skips resolution altogether.
 
 ### Formatting
 
@@ -80,12 +112,12 @@ line for the cleanest look.
 | Status | Meaning | Retry? |
 |---|---|---|
 | 200 | Sent. `deduplicated: true` means this idempotency key was already sent — nothing new went out. | — |
-| 400 | Bad input (`to` not a phone number / JID, text empty or too long). | No — fix the request. |
+| 400 | Bad input (`to` not a phone number / JID / username, text empty or too long). | No — fix the request. |
 | 401 / 403 | Missing, invalid or revoked key, or a route outside the key's scope. | No. |
 | 409 | Same idempotency key is in flight right now. | Yes, after a second. |
-| 422 | The number isn't on WhatsApp (often a missing country code). | No. |
+| 422 | The number isn't on WhatsApp (often a missing country code), or the username wasn't found (`error: "username_not_found"`). | No. |
 | 429 | Rate limited. Honour `Retry-After` (seconds). | Yes, after `Retry-After`. |
-| 502 | WhatsApp rejected the send. Failed sends can be retried with the same idempotency key. | Yes, with backoff. |
+| 502 | WhatsApp rejected the send, or a username lookup failed in transit. Failed sends can be retried with the same idempotency key. | Yes, with backoff. |
 | 503 | The bot is briefly disconnected from WhatsApp. | Yes, with backoff. |
 
 Error bodies look like `{ "error": "…", "message": "…" }`.

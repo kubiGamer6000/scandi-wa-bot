@@ -54,6 +54,22 @@ export const lidMappings = wa.table(
 	t => [primaryKey({ columns: [t.accountId, t.lid] }), index('lid_mappings_pn_idx').on(t.accountId, t.pn)]
 )
 
+/** WhatsApp username → JID (LID preferred). Backs @username notify recipients. */
+export const usernames = wa.table(
+	'usernames',
+	{
+		accountId: uuid('account_id')
+			.notNull()
+			.references(() => accounts.id, { onDelete: 'cascade' }),
+		username: text('username').notNull(),
+		jid: text('jid').notNull(),
+		source: text('source').notNull(),
+		firstSeenAt: timestamp('first_seen_at', { withTimezone: true }).notNull().defaultNow(),
+		lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).notNull().defaultNow()
+	},
+	t => [primaryKey({ columns: [t.accountId, t.username] }), index('usernames_jid_idx').on(t.accountId, t.jid)]
+)
+
 export const contacts = wa.table(
 	'contacts',
 	{

@@ -64,13 +64,46 @@ export const markdownToWhatsapp = (input: string): string => {
 }
 
 /**
- * Normalise a recipient into either a phone number (digits, international
- * format without `+`) or a WhatsApp JID. Returns null when it's neither.
+ * Normalise a WhatsApp username: strips a leading `@`, lowercases, and checks
+ * WhatsApp's rules (3–35 characters of a–z, 0–9, `.` and `_`, at least one
+ * letter, no leading/trailing or doubled dot). Returns null when invalid.
  */
-export const parseRecipient = (
-	raw: string
-): { kind: 'phone'; digits: string } | { kind: 'jid'; jid: string } | null => {
+export const normalizeUsername = (raw: string): string | null => {
+	const value = raw.trim().replace(/^@/, '').toLowerCase()
+	if (!/^[a-z0-9._]{3,35}$/.test(value)) return null
+	if (!/[a-z]/.test(value)) return null
+	if (value.startsWith('.') || value.endsWith('.') || value.includes('..')) return null
+	return value
+}
+
+export type Recipient =
+	| { kind: 'phone'; digits: string }
+	| { kind: 'jid'; jid: string }
+	| { kind: 'username'; username: string; key?: string }
+
+/**
+ * Normalise a recipient into a phone number (digits, international format
+ * without `+`), a WhatsApp JID, or a WhatsApp username. Returns null when it
+ * is none of them.
+ *
+ *   "+46 70 123 45 67"            → phone
+ *   "46701234567@s.whatsapp.net"  → jid   ("…@lid" too; groups refused)
+ *   "@handle"                     → username
+ *   { username: "handle", key? }  → username (key = the person's username PIN, if set)
+ */
+export const parseRecipient = (raw: string | { username: string; key?: string }): Recipient | null => {
+	if (typeof raw !== 'string') {
+		const username = normalizeUsername(raw.username)
+		if (!username) return null
+		const key = raw.key?.trim()
+		if (key !== undefined && key !== '' && !/^[A-Za-z0-9]{1,32}$/.test(key)) return null
+		return key ? { kind: 'username', username, key } : { kind: 'username', username }
+	}
 	const value = raw.trim()
+	if (value.startsWith('@')) {
+		const username = normalizeUsername(value)
+		return username ? { kind: 'username', username } : null
+	}
 	if (value.includes('@')) {
 		const jid = value.toLowerCase()
 		// Individual chats only — notifications never go to groups or broadcasts.

@@ -84,7 +84,10 @@ export const buildServer = async (deps: ApiDeps): Promise<FastifyInstance> => {
 			req.log.warn({ err, url: req.url, status }, 'api error')
 		}
 		reply.code(status).send({
-			error: status === 500 ? 'internal_error' : 'error',
+			error:
+				status === 500
+					? 'internal_error'
+					: ((err as FastifyError & { errorCode?: string }).errorCode ?? 'error'),
 			message: err.message || 'unknown error'
 		})
 	})

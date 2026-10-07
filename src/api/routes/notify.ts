@@ -5,6 +5,7 @@ import { config } from '../../config.js'
 import { db, schema } from '../../db/index.js'
 import { markdownToWhatsapp, parseRecipient } from '../format.js'
 import type { ApiDeps, TypedFastify } from '../types.js'
+import { resolveUsername } from '../usernames.js'
 import { waitForSeq } from './send.js'
 
 /**
@@ -25,11 +26,22 @@ import { waitForSeq } from './send.js'
 const MAX_TEXT_CHARS = 4096
 
 const NotifyBody = Type.Object({
-	to: Type.String({
-		minLength: 3,
-		maxLength: 64,
-		description: 'Phone number in international format (+46 70 123 45 67) or a WhatsApp JID'
-	}),
+	to: Type.Union([
+		Type.String({
+			minLength: 3,
+			maxLength: 64,
+			description:
+				'Phone number in international format (+46 70 123 45 67), a WhatsApp JID, or a WhatsApp username as "@handle"'
+		}),
+		Type.Object(
+			{
+				username: Type.String({ minLength: 1, maxLength: 64 }),
+				/** The person's username PIN, when they have set one. */
+				key: Type.Optional(Type.String({ minLength: 1, maxLength: 32 }))
+			},
+			{ additionalProperties: false }
+		)
+	]),
 	text: Type.String({ minLength: 1, maxLength: MAX_TEXT_CHARS * 2 }),
 	format: Type.Optional(Type.Union([Type.Literal('whatsapp'), Type.Literal('markdown')])),
 	idempotency_key: Type.Optional(Type.String({ minLength: 1, maxLength: 200 }))
@@ -114,9 +126,11 @@ export const registerNotifyRoutes = async (app: TypedFastify, deps: ApiDeps): Pr
 			const recipient = parseRecipient(body.to)
 			if (!recipient) {
 				throw app.httpErrors.badRequest(
-					'`to` must be a phone number in international format (e.g. +46701234567) or an individual WhatsApp JID'
+					'`to` must be a phone number in international format (e.g. +46701234567), an individual WhatsApp JID, or a WhatsApp username (e.g. "@handle")'
 				)
 			}
+			// What the caller asked for, as stored in wa.notifications.to_input.
+			const toInput = recipient.kind === 'username' ? `@${recipient.username}` : String(body.to)
 
 			// Idempotent replay: return the earlier result without sending again.
 			if (idempotencyKey) {
@@ -173,6 +187,23 @@ export const registerNotifyRoutes = async (app: TypedFastify, deps: ApiDeps): Pr
 			let toJid: string
 			if (recipient.kind === 'jid') {
 				toJid = recipient.jid
+			} else if (recipient.kind === 'username') {
+				let jid: string | null
+				try {
+					jid = await resolveUsername(sock, accountId, recipient.username, recipient.key)
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err)
+					req.log.warn({ key: key.keyPrefix, username: recipient.username, err: message }, 'username lookup failed')
+					throw app.httpErrors.badGateway(`WhatsApp username lookup failed: ${message}`)
+				}
+				if (!jid) {
+					const err = app.httpErrors.unprocessableEntity(
+						`username not found: @${recipient.username} is not a WhatsApp username the bot can reach`
+					)
+					;(err as unknown as { errorCode: string }).errorCode = 'username_not_found'
+					throw err
+				}
+				toJid = jid
 			} else {
 				const cached = resolved.get(recipient.digits)
 				let jid: string | null
@@ -229,7 +260,7 @@ export const registerNotifyRoutes = async (app: TypedFastify, deps: ApiDeps): Pr
 				INSERT INTO wa.notifications
 					(account_id, api_key_id, idempotency_key, to_input, to_jid, text_chars, status)
 				VALUES
-					(${accountId}, ${key.id}, ${idempotencyKey ?? null}, ${body.to}, ${toJid}, ${text.length}, 'pending')
+					(${accountId}, ${key.id}, ${idempotencyKey ?? null}, ${toInput}, ${toJid}, ${text.length}, 'pending')
 				ON CONFLICT (api_key_id, idempotency_key) WHERE idempotency_key IS NOT NULL
 				DO UPDATE SET status = 'pending', error = NULL, to_input = EXCLUDED.to_input,
 				              to_jid = EXCLUDED.to_jid, text_chars = EXCLUDED.text_chars, created_at = NOW()

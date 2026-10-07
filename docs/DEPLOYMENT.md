@@ -289,6 +289,8 @@ Current migrations:
 | `0003_media_queue.sql`              | `wa.media` table + media download job queue.                                                   |
 | `0004_media_processing.sql`         | `wa.media_processing` queue for AI processors (Gemini / ElevenLabs / LlamaParse).              |
 | `0005_api_layer.sql`                | `seq` bigserial on `wa.messages`, plus `wa.webhook_subscriptions` and `wa.webhook_deliveries`. |
+| `0006_notify_api.sql`              | `wa.api_keys` (scoped keys) and `wa.notifications` (POST /v1/notify audit + idempotency).      |
+| `0007_usernames.sql`               | `wa.usernames`: WhatsApp username → JID, backs `@username` notify recipients.                  |
 
 If you're upgrading an older deployment that's missing `0005`, run only
 that one — the others have already been applied. Re-running them is

@@ -18,6 +18,7 @@ import {
 	handleHistoryStatus
 } from './handlers/history.js'
 import { upsertLidMappings } from './handlers/lid.js'
+import { recordUsernameSightings, sightingsFromContacts, sightingsFromMessages } from './handlers/usernames.js'
 import {
 	handleMessageDeletes,
 	handleMessageUpdates,
@@ -111,10 +112,14 @@ export class ChatStore {
 
 		ev.on('contacts.upsert', list => {
 			void this.run('contacts.upsert', () => upsertContacts(this.ctx, list))
+			const sightings = sightingsFromContacts(list)
+			if (sightings.length) void this.run('usernames', () => recordUsernameSightings(this.ctx, sightings))
 		})
 		ev.on('contacts.update', list => {
 			const full = list.filter((c): c is { id: string } & typeof c => !!c.id)
 			void this.run('contacts.update', () => upsertContacts(this.ctx, full))
+			const sightings = sightingsFromContacts(full)
+			if (sightings.length) void this.run('usernames', () => recordUsernameSightings(this.ctx, sightings))
 		})
 
 		ev.on('chats.upsert', list => {
@@ -141,6 +146,8 @@ export class ChatStore {
 		ev.on('messages.upsert', payload => {
 			void this.run('messages.upsert', async () => {
 				await upsertMessages(this.ctx, payload.messages, this.cache)
+				const sightings = sightingsFromMessages(payload.messages)
+				if (sightings.length) await recordUsernameSightings(this.ctx, sightings)
 				// Best-effort wake of the media worker. We don't know without a
 				// query whether any new media rows were inserted, but a spurious
 				// wake costs one DB poll which the worker already does anyway.
